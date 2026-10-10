@@ -6,7 +6,7 @@
   python autodl_cli.py exec <lease_id> <命令> | put <lease> <本地> <远程> | get <lease> <远程> <本地>
   python autodl_cli.py renew <lease_id> | release <lease_id> [--keep]
   python autodl_cli.py off <机> [--lease ID] [--force]
-  python autodl_cli.py clone <owner> <机> [--yes]  不带 --yes 只预览
+  python autodl_cli.py clone <owner> <机> [--yes] [--lease ID]  不带 --yes 只预览；源机被租用时需 --lease
   python autodl_cli.py reap                       回收过期租约/无主机器（计划任务每 5 分钟调用）
 """
 import json
@@ -55,7 +55,7 @@ def main(argv: list[str]) -> int:
             "renew": lambda: m.renew(a[0]),
             "release": lambda: m.release(a[0], "--keep" in a),
             "off": lambda: m.power_off_guarded(a[0], _opt(a, "--lease", ""), "--force" in a),
-            "clone": lambda: m.manual_clone(a[0], a[1], True, "--yes" not in a, log),
+            "clone": lambda: m.manual_clone(a[0], a[1], True, "--yes" not in a, log, _opt(a, "--lease", "")),
             "reap": lambda: m.reap(),
         }[cmd]()
     except (c.AutoDLError, KeyError, IndexError) as e:

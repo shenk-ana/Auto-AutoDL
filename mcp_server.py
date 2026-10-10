@@ -142,13 +142,16 @@ async def autodl_job_status(lease_id: str, job_id: str, tail: int = 40) -> dict:
 
 @mcp.tool()
 async def autodl_put(lease_id: str, local: str, remote: str) -> dict:
-    """上传本地文件/目录到租约机器；租约至少顺延 1 小时（长传输不会被半路关机）。"""
+    """上传本地文件/目录到租约机器；租约至少顺延 1 小时（长传输不会被半路关机）。
+    出于安全考虑拒绝 ~/.ssh、私钥、本项目 .secrets/state 等敏感路径；配置了 transfer_roots 时只能读取其中的路径。"""
     return await _run(m.put_file, lease_id, local, remote)
 
 
 @mcp.tool()
 async def autodl_get(lease_id: str, remote: str, local: str) -> dict:
-    """从租约机器下载文件/目录；租约至少顺延 1 小时（长传输不会被半路关机）。"""
+    """从租约机器下载文件/目录；租约至少顺延 1 小时（长传输不会被半路关机）。
+    local 只能位于下载目录（config.json 的 download_root，默认 ~/autodl-transfer；相对路径以它为基准），
+    配置了 transfer_roots 时改为其中之一。返回值里的 local 是实际写入位置。"""
     return await _run(m.get_file, lease_id, remote, local)
 
 
@@ -174,10 +177,12 @@ async def autodl_power_off(instance: str, lease_id: str = "", force: bool = Fals
 
 
 @mcp.tool()
-async def autodl_clone(owner: str, instance: str, copy_data_disk: bool = True, dry_run: bool = True) -> dict:
+async def autodl_clone(owner: str, instance: str, copy_data_disk: bool = True, dry_run: bool = True,
+                       lease_id: str = "") -> dict:
     """手动克隆。默认 dry_run=True 只预览；下单需 dry_run=false，计入每日 10 次配额，并给 owner 发租约
-    （真下单会等克隆机开机并复制完数据盘才返回，可能数分钟，注意客户端超时）。"""
-    return await _run(m.manual_clone, owner, instance, copy_data_disk, dry_run)
+    （真下单会等克隆机开机并复制完数据盘才返回，可能数分钟，注意客户端超时）。
+    源机器正被租用时必须传它的 lease_id（克隆会复制数据盘）。"""
+    return await _run(m.manual_clone, owner, instance, copy_data_disk, dry_run, lease_id=lease_id)
 
 
 # ---------------------------------------------------------------- 回收器 / 启动

@@ -248,16 +248,18 @@ Override in `config.json`; missing keys use the defaults. Restart the service af
 | `adopt_running` | `false` | Allow taking over instances you started yourself |
 | `ssh_key` | `~/.ssh/id_ed25519` | Private key used to log in to instances |
 | `region_groups` | `[["west-B","west-C","west-D","west-E"]]` | Region signs that count as one region for cloning; add yours if needed |
-| `transfer_roots` | `[]` | Local directories `autodl_put` / `autodl_get` may use; empty means unrestricted (sensitive paths are always refused) |
+| `transfer_roots` | `[]` | Local directories `autodl_put` / `autodl_get` may use; when empty, uploads are unrestricted and downloads go to `download_root` only (sensitive paths are always refused) |
+| `download_root` | `~/autodl-transfer` | Default destination for `autodl_get`; relative paths resolve against it |
 
 ## 🛡️ Security notes
 
 > [!CAUTION]
 > The service binds to `127.0.0.1` only. **Do not expose it on `0.0.0.0`** — anyone with the token can run arbitrary commands on your instances and spend your balance.
 
-- `autodl_put` / `autodl_get` always refuse sensitive paths (`~/.ssh`, private keys, this project's `.secrets/` and `state/`), and downloads cannot write into the project directory. Setting `transfer_roots` in `config.json` to your data directories is recommended.
+- `autodl_put` / `autodl_get` always refuse sensitive paths (`~/.ssh`, private keys, this project's `.secrets/` and `state/`), and downloads may only write into `download_root` (`~/autodl-transfer`) so startup files such as `~/.bashrc` cannot be overwritten. Setting `transfer_roots` in `config.json` to your data directories is recommended.
 - `.secrets/`, `state/`, `logs/`, `machines.json` and `ssh_config.autodl` contain credentials or personal data and are git-ignored — **don't commit them**.
 - Log redaction is best-effort and only covers common forms (`--token xxx`, `XXX_TOKEN=xxx`, `Bearer xxx`, `hf_` / `sk-` keys, …). Keep secrets in env files on the instance rather than inline in commands.
+- Auto-clone only copies from instances nobody is leasing; manually cloning a leased instance requires its `lease_id`, so one lease's data disk is never copied to another tenant.
 - SSH host-key checking is disabled because AutoDL hosts and ports change after cloning; use on trusted networks.
 - Cloning only works within one region (see `region_groups`); some hosts don't support cloning, and the next candidate is tried automatically.
 - Instances you start yourself in the web console are not lease-protected and won't be reaped, unless taken over with `autodl_acquire(prefer=…)`.

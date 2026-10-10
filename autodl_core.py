@@ -50,8 +50,9 @@ DEFAULT_CONFIG = {
     "ssh_key": str(Path.home() / ".ssh" / "id_ed25519"),
     # 克隆只能在同一"地区"内：每组是控制台里同一地区的 region_sign，例如西北B区 = west-B/C/D/E
     "region_groups": [["west-B", "west-C", "west-D", "west-E"]],
-    # put/get 允许的本地目录；为空表示不限（敏感路径始终拒绝，见 check_local_path）
+    # put/get 允许的本地目录；为空时上传不限、下载只能写进 download_root（敏感路径始终拒绝，见 check_local_path）
     "transfer_roots": [],
+    "download_root": str(Path.home() / "autodl-transfer"),  # autodl_get 的默认落地目录，相对路径以它为基准
 }
 # 返回给 AI 的字段白名单：绝不包含 root_password / jupyter_token
 PUBLIC_FIELDS = [
@@ -547,11 +548,23 @@ def _sensitive_paths() -> list[Path]:
 def check_local_path(local: str, upload: bool) -> Path:
     """校验 put/get 的本地路径（解析符号链接和 .. 之后判断），不合规则抛 AutoDLError。
     上传：不能是敏感路径、不能包含敏感路径，目录里的符号链接也不能指向敏感路径（scp -r 会跟随链接）。
-    下载：不能写进 ~/.ssh 或本项目目录（代码、配置、凭据）。配置了 transfer_roots 时还必须位于其中之一。"""
-    p = Path(local).expanduser().resolve()
-    roots = [Path(x).expanduser().resolve() for x in load_config().get("transfer_roots") or []]
+    下载：只能写进 download_root（相对路径以它为基准），配置了 transfer_roots 时改为其中之一；
+    防止覆盖 ~/.bashrc 之类的启动文件。返回解析后的绝对路径，调用方应使用它。"""
+    cfg = load_config()
+    roots = [Path(x).expanduser().resolve() for x in cfg.get("transfer_roots") or []]
+    p = Path(local).expanduser()
+    if not upload:
+        dl_root = Path(cfg["download_root"]).expanduser().resolve()
+        if not p.is_absolute():
+            p = dl_root / p
+        if not roots:
+            roots = [dl_root]
+            dl_root.mkdir(parents=True, exist_ok=True)
+    p = p.resolve()
     if roots and not any(_inside(p, r) for r in roots):
-        raise AutoDLError(f"本地路径 {p} 不在 config.json 的 transfer_roots 允许范围内")
+        where = "下载只能写入" if not upload else "上传只能读取"
+        raise AutoDLError(f"本地路径 {p} 不在允许范围内：{where} {', '.join(map(str, roots))}"
+                          f"（config.json 的 transfer_roots / download_root）")
     deny = _sensitive_paths()
     if not upload:
         deny += [ROOT.resolve()]
@@ -570,7 +583,7 @@ def check_local_path(local: str, upload: bool) -> Path:
 
 
 def run_scp(ref: str, local: str, remote: str, upload: bool, timeout: int = 3600) -> dict:
-    check_local_path(local, upload)
+    local = str(check_local_path(local, upload))
     inst = _running(ref)
     lg = machine_login(inst)
     rem = f"{lg['user']}@{lg['host']}:{remote}"

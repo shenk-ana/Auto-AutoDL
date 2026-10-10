@@ -166,10 +166,12 @@ def acquire(owner: str, purpose: str = "", prefer: str | None = None, ttl_minute
                     if not cfg["auto_clone"] or no_gpu:
                         ops("ACQUIRE", "ERR", error="等待超时，未克隆")
                         raise AutoDLError("等待超时，没有可用机器（auto_clone 关闭或无卡模式不克隆）")
-                    cands = [i for i in items if _match(prefer, i)] or items
+                    # 只从没被租用的机器克隆（不复制别人租约里的数据盘），优先关机的
+                    cands = [i for i in ([i for i in items if _match(prefer, i)] or items) if i["uuid"] not in leased]
                     if not cands:
-                        raise AutoDLError("账号下没有任何实例可克隆")
-                    src = cands[0]
+                        ops("ACQUIRE", "ERR", error="没有未租用的机器可作克隆源")
+                        raise AutoDLError("等待超时，且没有未被租用的机器可作克隆源（不会复制别人租约里的数据）")
+                    src = sorted(cands, key=lambda i: i["status"] != "shutdown")[0]
                     log("等待超时，克隆同配置机器（含数据盘）")
                     res = c.clone_instance(src["uuid"], cfg["clone_data_disk"])
                     pick, how = {"uuid": res["new_uuid"], "machine_alias": "(克隆中)"}, "clone"
@@ -319,13 +321,13 @@ def put_file(lease_id: str, local: str, remote: str) -> dict:
 
 
 def get_file(lease_id: str, remote: str, local: str) -> dict:
-    c.check_local_path(local, upload=False)
+    local = str(c.check_local_path(local, upload=False))  # 相对路径落到 download_root
     rec = _get_lease(lease_id, min_seconds=3600 + 60)
     with oplog.context(owner=rec["owner"], lease=lease_id):
         _touch_remote(rec, lease_id, "开始下载")
         r = c.run_scp(rec["uuid"], local, remote, upload=False)
         ops("GET", "OK" if r["exit"] == 0 else "ERR", instance=rec["uuid"], remote=remote, local=local)
-    return r
+    return {**r, "local": local}
 
 
 # ---------------------------------------------------------------- 释放 / 关机
@@ -507,18 +509,25 @@ def machines_view() -> list[dict]:
     return out
 
 
-def manual_clone(owner: str, instance: str, copy_data_disk: bool = True, dry_run: bool = True, log=lambda m: None) -> dict:
-    """手动克隆。dry_run=True 只预览；否则下单并给 owner 发租约（克隆后自动开机、等数据盘复制完）。"""
+def manual_clone(owner: str, instance: str, copy_data_disk: bool = True, dry_run: bool = True, log=lambda m: None,
+                 lease_id: str = "") -> dict:
+    """手动克隆。dry_run=True 只预览；否则下单并给 owner 发租约（克隆后自动开机、等数据盘复制完）。
+    源机器正被租用时必须提供它的 lease_id（克隆会复制数据盘）。"""
     if dry_run:
         return c.clone_instance(instance, copy_data_disk, dry_run=True)
     if not owner:
         raise AutoDLError("owner 不能为空")
     with oplog.context(owner=owner):
         with state_lock():
-            res = c.clone_instance(instance, copy_data_disk)
+            src = c.find(c.list_instances(), instance)
+            holder = next(((lid, r) for lid, r in _load().items() if r["uuid"] == src["uuid"]), None)
+            if holder and lease_id != holder[0]:
+                ops("CLONE", "DENY", source=src["machine_alias"], holder=holder[1]["owner"], reason="源机器被租用，缺少 lease_id")
+                raise AutoDLError(f"{src['machine_alias']} 正被 {holder[1]['owner']} 租用，克隆会复制它的数据盘；"
+                                  f"请提供该租约的 lease_id，或换一台未租用的机器")
+            res = c.clone_instance(src["uuid"], copy_data_disk)
             lid, rec = _new_lease(owner, "手动克隆", res["new_uuid"], "(克隆中)", None, True)
             _mark_managed(res["new_uuid"])
-            src = c.find(c.list_instances(), instance)
             c.set_machine(res["new_uuid"], cloned_from=src["uuid"], **c.login_overrides(src["uuid"]))
         with oplog.context(lease=lid):
             ops("LEASE_CREATE", "OK", instance=res["new_uuid"], via="manual_clone")
