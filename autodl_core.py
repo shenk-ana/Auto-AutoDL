@@ -11,6 +11,7 @@ import contextlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import threading
@@ -91,14 +92,17 @@ def jsave(path: Path, obj: Any) -> None:
 
 @contextlib.contextmanager
 def state_lock(name: str = "state", timeout: float = 90, stale: float = 180):
-    """跨进程（多个窗口）互斥：O_EXCL 锁文件，持有超过 stale 秒视为遗留锁。"""
+    """跨进程（多个窗口）互斥：O_EXCL 锁文件，超过 stale 秒没有心跳视为遗留锁（持有者已崩溃）。
+    持有期间后台线程定期刷新锁文件时间，持锁做长时间网络操作（回收器逐台 ssh、克隆多次尝试）也不会被误删；
+    释放时只删自己写的锁。"""
     STATE.mkdir(exist_ok=True)
     path = STATE / f"{name}.lock"
+    token = f"{os.getpid()}-{secrets.token_hex(4)}"
     start = time.time()
     while True:
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
+            os.write(fd, token.encode())
             os.close(fd)
             break
         except FileExistsError:
@@ -111,10 +115,21 @@ def state_lock(name: str = "state", timeout: float = 90, stale: float = 180):
             if time.time() - start > timeout:
                 raise AutoDLError(f"等待锁 {name} 超时（另一个窗口正在分配/操作）")
             time.sleep(0.2)
+    stop = threading.Event()
+
+    def heartbeat():
+        while not stop.wait(max(1.0, stale / 6)):
+            with contextlib.suppress(OSError):
+                os.utime(path)
+
+    threading.Thread(target=heartbeat, daemon=True).start()
     try:
         yield
     finally:
-        path.unlink(missing_ok=True)
+        stop.set()
+        with contextlib.suppress(OSError):
+            if path.read_text(encoding="utf-8") == token:
+                path.unlink()
 
 
 # ---------------------------------------------------------------- 登录态
@@ -251,10 +266,16 @@ def clone_quota() -> dict:
 
 # ---------------------------------------------------------------- 查询
 def _raw_instances() -> list[dict]:
-    d = _call("POST", "/api/v1/instance", {
-        "page_index": 1, "page_size": 100, "status": [], "charge_type": [],
-        "sub_name": "", "unbind_sub_user": False})
-    return d.get("list", [])
+    out: list[dict] = []
+    for page in range(1, 51):  # 逐页读全；不满一页即最后一页
+        d = _call("POST", "/api/v1/instance", {
+            "page_index": page, "page_size": 100, "status": [], "charge_type": [],
+            "sub_name": "", "unbind_sub_user": False})
+        items = d.get("list") or []
+        out += items
+        if len(items) < 100:
+            break
+    return out
 
 
 def _public(i: dict) -> dict:

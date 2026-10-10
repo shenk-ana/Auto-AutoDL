@@ -370,13 +370,14 @@ def power_off_guarded(instance: str, lease_id: str = "", force: bool = False) ->
 
 
 # ---------------------------------------------------------------- 回收器
-def _jobs_alive(uuid: str) -> bool:
+def _jobs_alive(uuid: str) -> bool | None:
+    """机内是否还有后台任务在跑；ssh 不通时返回 None（未知），别当成“没有任务”去关机。"""
     try:
         r = c.run_ssh(uuid, 'for f in /root/.autodl_jobs/*.pid; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && '
                       'echo ALIVE; done; true', timeout=30, log=False)
-        return "ALIVE" in r["output"]
     except AutoDLError:
-        return False
+        return None
+    return "ALIVE" in r["output"] if r["exit"] == 0 else None
 
 
 def reap() -> list[str]:
@@ -396,14 +397,29 @@ def reap() -> list[str]:
                     acts.append(f"{lid}: 实例不存在，撤销租约")
                     continue
                 expired = now > r["expires_at"]
-                if expired and inst["status"] == "running" and r["state"] == "active" and now < r["hard_deadline"] \
-                        and _jobs_alive(r["uuid"]):
-                    r["expires_at"] = min(now + 600, r["hard_deadline"])
-                    d[lid] = r
-                    ops("REAP", "OK", action="extend", reason="后台任务仍在运行", instance=r["uuid"],
-                        expires=human(r["expires_at"]))
-                    acts.append(f"{lid}: 后台任务仍在跑，顺延 10 分钟")
-                    continue
+                if expired and inst["status"] == "running" and r["state"] == "active" and now < r["hard_deadline"]:
+                    alive = _jobs_alive(r["uuid"])
+                    if alive is None:  # 探测失败：状态未知，保留租约下一轮再看（硬上限后不再探测，直接关）
+                        ops("REAP", "ERR", action="probe", reason="ssh 探测后台任务失败", instance=r["uuid"])
+                        acts.append(f"{lid}: 探测后台任务失败，下一轮重试")
+                        continue
+                    if alive:  # 本地和机内守护一起顺延，远端写不进去就不顺延
+                        ext = {**r, "expires_at": min(now + 600, r["hard_deadline"])}
+                        try:
+                            rr = c.run_ssh(r["uuid"], _deadline_cmds(ext, cfg), timeout=60,
+                                           shown=f"# [autodl] 后台任务仍在运行，保险关机顺延至 "
+                                                 f"{human(ext['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
+                        except AutoDLError as e:
+                            rr = {"exit": -1, "output": str(e)}
+                        if rr["exit"] != 0:
+                            ops("REAP", "ERR", action="extend", instance=r["uuid"], exit=rr["exit"])
+                            acts.append(f"{lid}: 后台任务仍在跑，但机内保险未能顺延，下一轮重试")
+                            continue
+                        d[lid] = r = ext
+                        ops("REAP", "OK", action="extend", reason="后台任务仍在运行", instance=r["uuid"],
+                            expires=human(r["expires_at"]))
+                        acts.append(f"{lid}: 后台任务仍在跑，顺延 10 分钟")
+                        continue
                 if expired:
                     if inst["status"] in ("starting", "creating", "created_cloning", "created"):
                         # 还在开机/克隆，现在关不了：保留租约，等它 running 后下一轮再关
