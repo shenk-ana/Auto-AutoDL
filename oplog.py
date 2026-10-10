@@ -5,13 +5,14 @@
      [2026-10-07 12:34:57.012] <输出行，含 stderr>
    多行命令续行以 "> " 开头；传文件用 "[local]$ scp ..." 记录。
 ② logs/autodl/YYYYMMDD.log —— AutoDL 平台操作：
-     [2026-10-07 12:34:56.789] POWER_ON       OK   owner=my-project/train-01 lease=a1b2c3 instance=001机 mode=gpu
+     [2026-10-07 12:34:56.789] POWER_ON       OK   owner=my-project/train-01 lease=L3f9a0c2d instance=001机 mode=gpu
    格式：[时间] 动作(14 宽) 结果(OK/ERR/DENY, 4 宽) 键=值 ...；值含空格时用 JSON 引号。
 """
 from __future__ import annotations
 
 import contextlib
 import contextvars
+import hashlib
 import json
 import re
 import threading
@@ -71,8 +72,15 @@ def _val(v) -> str:
     return s if re.fullmatch(r"[\w./:@+\-]+", s) else json.dumps(s, ensure_ascii=False)
 
 
+def lease_tag(lease_id: str) -> str:
+    """日志里代替 lease_id 的不可逆短标签：autodl_logs 对所有客户端可读，完整 lease_id 等于操作凭据。"""
+    return "L" + hashlib.sha256(str(lease_id).encode()).hexdigest()[:8]
+
+
 def ops(event: str, result: str = "OK", /, **kv) -> None:
     kv = {**_ctx.get(), **kv}
+    if kv.get("lease"):
+        kv["lease"] = lease_tag(kv["lease"])
     body = " ".join(f"{k}={_val(v)}" for k, v in kv.items() if v not in (None, ""))
     line = f"[{ts()}] {event:<14} {result:<4} {body}".rstrip() + "\n"
     _append(LOG_DIR / "autodl" / f"{datetime.now():%Y%m%d}.log", line)

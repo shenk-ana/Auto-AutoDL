@@ -388,6 +388,18 @@ def _region_group(sign: str) -> list[str]:
     return [sign]
 
 
+def abandon_instance(uuid: str, err: BaseException) -> None:
+    """克隆已下单（新实例已在计费）但本地记录失败时调用：尽力关机，并抛出带实例 ID 的错误让用户去控制台核实。
+    这里不写日志/状态文件——失败的原因往往就是磁盘写不进去。"""
+    try:
+        _instance_op("power_off", {"instance_uuid": uuid})
+        tried = "已发出关机请求"
+    except Exception:  # noqa: BLE001  实例可能还在创建中，关机会被拒
+        tried = "关机请求失败（实例可能仍在创建中）"
+    raise AutoDLError(f"克隆已下单，新实例 {uuid} 在计费，但本地记录失败（{err!r}）；{tried}，"
+                      f"请到 AutoDL 控制台确认该实例已关机或释放") from err
+
+
 def clone_instance(ref: str, copy_data_disk: bool = True, dry_run: bool = False) -> dict:
     """克隆一台同配置机器（含数据盘），按量计费，克隆后自动开机。受每日配额限制。"""
     raw = {i["uuid"]: i for i in _raw_instances()}
@@ -449,10 +461,13 @@ def clone_instance(ref: str, copy_data_disk: bool = True, dry_run: bool = False)
                 if "FacilityNotSupported" not in str(e) and "NoGpu" not in str(e) and "Stock" not in str(e):
                     raise
                 continue
-            log = jload(STATE / "clone_log.json", [])
-            log.append({"date": q["date"], "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        "source": src["uuid"], "new_uuid": new_uuid})
-            jsave(STATE / "clone_log.json", log)
+            try:
+                log = jload(STATE / "clone_log.json", [])
+                log.append({"date": q["date"], "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "source": src["uuid"], "new_uuid": new_uuid})
+                jsave(STATE / "clone_log.json", log)
+            except Exception as e:  # noqa: BLE001
+                abandon_instance(new_uuid, e)
             ops("CLONE", "OK", source=f"{src['machine_alias']}({src['uuid']})", new_instance=new_uuid,
                 target=tgt.get("machine_alias"), data_disk=copy_data_disk, quota_left=q["remaining"] - 1)
             return {"new_uuid": new_uuid, "source_uuid": src["uuid"], "target_machine": tgt.get("machine_alias"),
@@ -536,9 +551,19 @@ def _inside(p: Path, root: Path) -> bool:
     return a == b or a.startswith(b.rstrip("\\/") + os.sep)
 
 
+# 常见的本机凭据位置（相对家目录）。拒绝列表无法穷尽，要彻底收紧请配置 transfer_roots
+_CREDENTIAL_DIRS = [
+    ".ssh", ".aws", ".azure", ".config/gcloud", ".config/gh", ".config/hub", ".gnupg", ".password-store",
+    ".netrc", "_netrc", ".git-credentials", ".docker", ".kube", ".npmrc", ".pypirc", ".pgpass", ".vault-token",
+    ".terraform.d", ".claude", ".codex", ".config/claude", ".huggingface", ".cache/huggingface/token",
+    "AppData", "Library/Keychains",
+]
+
+
 def _sensitive_paths() -> list[Path]:
-    """绝不允许传出的本地路径：SSH 目录、本项目的凭据和状态、配置及逐台登记的私钥。"""
-    paths = [Path.home() / ".ssh", ROOT / ".secrets", STATE, Path(load_config()["ssh_key"]).expanduser()]
+    """绝不允许传出的本地路径：常见凭据目录、本项目的凭据和状态、配置及逐台登记的私钥。"""
+    paths = [Path.home() / d for d in _CREDENTIAL_DIRS]
+    paths += [ROOT / ".secrets", STATE, Path(load_config()["ssh_key"]).expanduser()]
     for r in jload(MACHINES, {}).get("instances", {}).values():
         if r.get("key"):
             paths.append(Path(r["key"]).expanduser())

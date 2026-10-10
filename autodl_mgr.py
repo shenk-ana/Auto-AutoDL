@@ -175,9 +175,12 @@ def acquire(owner: str, purpose: str = "", prefer: str | None = None, ttl_minute
                     log("等待超时，克隆同配置机器（含数据盘）")
                     res = c.clone_instance(src["uuid"], cfg["clone_data_disk"])
                     pick, how = {"uuid": res["new_uuid"], "machine_alias": "(克隆中)"}, "clone"
-                    lid, rec = _new_lease(owner, purpose, res["new_uuid"], "(克隆中)", ttl_minutes, True)
-                    _mark_managed(res["new_uuid"])
-                    c.set_machine(res["new_uuid"], cloned_from=src["uuid"], **c.login_overrides(src["uuid"]))
+                    try:  # 新实例已在计费：本地记账失败就关掉它，别留下回收器看不到的机器
+                        lid, rec = _new_lease(owner, purpose, res["new_uuid"], "(克隆中)", ttl_minutes, True)
+                        _mark_managed(res["new_uuid"])
+                        c.set_machine(res["new_uuid"], cloned_from=src["uuid"], **c.login_overrides(src["uuid"]))
+                    except Exception as e:  # noqa: BLE001
+                        c.abandon_instance(res["new_uuid"], e)
                     with oplog.context(lease=lid):
                         ops("LEASE_CREATE", "OK", instance=res["new_uuid"], via="clone")
                     break
@@ -526,9 +529,12 @@ def manual_clone(owner: str, instance: str, copy_data_disk: bool = True, dry_run
                 raise AutoDLError(f"{src['machine_alias']} 正被 {holder[1]['owner']} 租用，克隆会复制它的数据盘；"
                                   f"请提供该租约的 lease_id，或换一台未租用的机器")
             res = c.clone_instance(src["uuid"], copy_data_disk)
-            lid, rec = _new_lease(owner, "手动克隆", res["new_uuid"], "(克隆中)", None, True)
-            _mark_managed(res["new_uuid"])
-            c.set_machine(res["new_uuid"], cloned_from=src["uuid"], **c.login_overrides(src["uuid"]))
+            try:
+                lid, rec = _new_lease(owner, "手动克隆", res["new_uuid"], "(克隆中)", None, True)
+                _mark_managed(res["new_uuid"])
+                c.set_machine(res["new_uuid"], cloned_from=src["uuid"], **c.login_overrides(src["uuid"]))
+            except Exception as e:  # noqa: BLE001
+                c.abandon_instance(res["new_uuid"], e)
         with oplog.context(lease=lid):
             ops("LEASE_CREATE", "OK", instance=res["new_uuid"], via="manual_clone")
             return _finish_boot(lid, rec, log)

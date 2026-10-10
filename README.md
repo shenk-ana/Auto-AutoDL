@@ -219,9 +219,9 @@ flowchart LR
 - **机器登录信息统一登记**：`machines.json` 记录每台机器当前的主机、端口、用户、密钥路径、克隆来源，每次查询自动刷新；同时生成 `ssh_config.autodl`，在 `~/.ssh/config` 里 `Include` 它就能用 `ssh autodl-001` 这类别名。**不保存密码**。
 - **克隆配额**：默认每天最多 10 次（北京时间自然日），计数在 `state/clone_log.json`，超出直接拒绝。
 - **日志**（只追加，时间精确到毫秒）
-  - `logs/autodl/YYYYMMDD.log`：平台操作
+  - `logs/autodl/YYYYMMDD.log`：平台操作（`lease` 记为不可逆的短标签，日志对所有客户端可读，不能泄露租约凭据）
     ```text
-    [2026-10-07 12:34:56.789] POWER_ON       OK   owner=my-project/train-01 lease=a1b2c3 instance=001机 mode=gpu
+    [2026-10-07 12:34:56.789] POWER_ON       OK   owner=my-project/train-01 lease=L3f9a0c2d instance=001机 mode=gpu
     ```
   - `logs/linux/YYYYMMDD_autodl-<编号>.log`：每台机器的命令会话，TeraTerm 格式
     ```text
@@ -256,7 +256,7 @@ flowchart LR
 > [!CAUTION]
 > 服务只绑定 `127.0.0.1`，**不要改成 `0.0.0.0` 暴露到网络**。拿到口令的人可以在你的实例上执行任意命令并消耗你的余额。
 
-- `autodl_put` / `autodl_get` 始终拒绝传输敏感路径：`~/.ssh`、私钥、本项目的 `.secrets/` 和 `state/`。下载默认只能写进 `download_root`（`~/autodl-transfer`），防止覆盖 `~/.bashrc` 这类启动文件。建议在 `config.json` 里设置 `transfer_roots`，只允许数据目录。
+- `autodl_put` / `autodl_get` 始终拒绝传输敏感路径：`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`~/.config/gh` 等常见凭据位置、私钥、本项目的 `.secrets/` 和 `state/`（拒绝列表无法穷尽，要彻底收紧请配置 `transfer_roots`）。下载默认只能写进 `download_root`（`~/autodl-transfer`），防止覆盖 `~/.bashrc` 这类启动文件。建议在 `config.json` 里设置 `transfer_roots`，只允许数据目录。
 - 自动克隆只从没被租用的机器上复制；手动克隆正被租用的机器需要提供那台的 `lease_id`，不会把别人租约里的数据盘复制给新租户。
 - 以下文件包含凭据或个人信息，已被 `.gitignore` 排除，**不要提交**：`.secrets/`、`state/`、`logs/`、`machines.json`、`ssh_config.autodl`。
 - 日志脱敏是尽力而为，只覆盖常见写法（`--token xxx`、`XXX_TOKEN=xxx`、`Bearer xxx`、`hf_` / `sk-` 开头的密钥等）。敏感值尽量放在实例上的环境文件里，不要直接写进命令。

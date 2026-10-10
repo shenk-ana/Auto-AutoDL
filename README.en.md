@@ -219,9 +219,9 @@ flowchart LR
 - **Login registry**: `machines.json` tracks each instance's current host, port, user, key path and clone source, refreshed on every query; `ssh_config.autodl` is generated alongside — `Include` it in `~/.ssh/config` to use aliases like `ssh autodl-001`. **No passwords are stored.**
 - **Clone quota**: 10 per day by default (Beijing calendar day), counted in `state/clone_log.json`; requests beyond it are refused.
 - **Logs** (append-only, millisecond timestamps)
-  - `logs/autodl/YYYYMMDD.log`: platform operations
+  - `logs/autodl/YYYYMMDD.log`: platform operations (`lease` is logged as an irreversible short tag; logs are readable by every client, so they must not leak lease credentials)
     ```text
-    [2026-10-07 12:34:56.789] POWER_ON       OK   owner=my-project/train-01 lease=a1b2c3 instance=001机 mode=gpu
+    [2026-10-07 12:34:56.789] POWER_ON       OK   owner=my-project/train-01 lease=L3f9a0c2d instance=001机 mode=gpu
     ```
   - `logs/linux/YYYYMMDD_autodl-<number>.log`: per-machine shell sessions, TeraTerm style
     ```text
@@ -256,7 +256,7 @@ Override in `config.json`; missing keys use the defaults. Restart the service af
 > [!CAUTION]
 > The service binds to `127.0.0.1` only. **Do not expose it on `0.0.0.0`** — anyone with the token can run arbitrary commands on your instances and spend your balance.
 
-- `autodl_put` / `autodl_get` always refuse sensitive paths (`~/.ssh`, private keys, this project's `.secrets/` and `state/`), and downloads may only write into `download_root` (`~/autodl-transfer`) so startup files such as `~/.bashrc` cannot be overwritten. Setting `transfer_roots` in `config.json` to your data directories is recommended.
+- `autodl_put` / `autodl_get` always refuse sensitive paths (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.netrc`, `~/.config/gh` and other common credential stores, private keys, this project's `.secrets/` and `state/`; a deny list can never be complete, so set `transfer_roots` to lock it down), and downloads may only write into `download_root` (`~/autodl-transfer`) so startup files such as `~/.bashrc` cannot be overwritten. Setting `transfer_roots` in `config.json` to your data directories is recommended.
 - `.secrets/`, `state/`, `logs/`, `machines.json` and `ssh_config.autodl` contain credentials or personal data and are git-ignored — **don't commit them**.
 - Log redaction is best-effort and only covers common forms (`--token xxx`, `XXX_TOKEN=xxx`, `Bearer xxx`, `hf_` / `sk-` keys, …). Keep secrets in env files on the instance rather than inline in commands.
 - Auto-clone only copies from instances nobody is leasing; manually cloning a leased instance requires its `lease_id`, so one lease's data disk is never copied to another tenant.
