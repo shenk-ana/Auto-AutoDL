@@ -400,17 +400,28 @@ def _region_group(sign: str) -> list[str]:
     return [sign]
 
 
-def _find_new_instance(before: set[str], tries: int = 4, wait: float = 5) -> str | None:
-    """克隆下单网络异常后的对账：比较下单前后的实例列表（克隆在 clone 锁内串行，新出现的就是这次下的单）。"""
+def _find_new_instance(before: set[str], machine_id: str, gpu: str, tries: int = 4, wait: float = 5) -> str | None:
+    """克隆下单网络异常后的对账：只接管下单后新出现、落在这次下单的目标宿主机上、GPU 型号一致的唯一实例。
+    控制台上同时新建的其他实例不在 clone 锁的管辖内，候选不唯一或对不上时不猜，抛错列出候选让用户核实。"""
+    seen: list[dict] = []
     for n in range(tries):
         if n:
             time.sleep(wait)
         try:
-            new = [i["uuid"] for i in _raw_instances() if i["uuid"] not in before]
+            seen = [i for i in _raw_instances() if i["uuid"] not in before]
         except AutoDLError:
             continue
-        if new:
-            return new[0]
+        hit = [i for i in seen if i.get("machine_id") == machine_id
+               and i.get("snapshot_gpu_alias_name", gpu) in (gpu, "", None)]
+        if len(hit) == 1:
+            return hit[0]["uuid"]
+        if len(hit) > 1:
+            break
+    if seen:
+        ids = ", ".join(f"{i['uuid']}({i.get('machine_alias') or '?'}, {i.get('snapshot_gpu_alias_name') or '?'})"
+                        for i in seen)
+        raise AutoDLError(f"克隆下单时网络异常，下单后出现的新实例无法唯一对应这次克隆（{ids}），"
+                          f"未自动接管；请到 AutoDL 控制台核实，多余的计费实例请手动关机或释放")
     return None
 
 
@@ -482,7 +493,7 @@ def clone_instance(ref: str, copy_data_disk: bool = True, dry_run: bool = False)
             except AuthError:
                 raise
             except AutoDLNetworkError as e:  # 下单结果未知：对账，找到新实例就照常接管，别让它成为没人管的计费机器
-                new_uuid = _find_new_instance(set(raw))
+                new_uuid = _find_new_instance(set(raw), tgt["machine_id"], gpu)
                 if not new_uuid:
                     ops("CLONE", "ERR", source=src["machine_alias"], error=f"下单结果未知且未发现新实例：{e}")
                     raise AutoDLError(f"克隆下单时网络异常，对账未发现新实例，请到控制台确认是否已创建：{e}") from e

@@ -14,7 +14,14 @@ import time
 
 import autodl_core as c
 import oplog
-from autodl_core import AutoDLError, jload, jsave, load_config, state_lock
+from autodl_core import (
+    AutoDLError,
+    AutoDLNetworkError,
+    jload,
+    jsave,
+    load_config,
+    state_lock,
+)
 from oplog import human, ops
 
 LEASES = c.STATE / "leases.json"
@@ -104,17 +111,24 @@ def _ttl_seconds(cfg: dict, minutes: float | None) -> float:
     return max(60.0, min(m * 60, cfg["max_lease_hours"] * 3600))
 
 
-def _deadline_cmds(rec: dict, cfg: dict, keep_off: bool = True) -> str:
-    """写机内保险截止时间。默认 keep_off：用户已用 keep_running 解除保险（off）就不覆盖——
-    在途的续租/exec/传输/回收顺延都不能把交还给用户的机器重新挂上关机时间。只有安装守护时传 False。"""
+def _deadline_cmds(rec: dict, cfg: dict, install: bool = False) -> str:
+    """写机内保险截止时间。平时（续租/exec/传输/回收顺延）和远端现值取最大（flock 串行化读-改-写，原子替换），
+    并发操作谁先谁后都不会把别人写的较晚期限改早；用户已用 keep_running 解除保险（off）也不覆盖。
+    install=True 只在安装守护时用（租约仍是 pending、还没交给调用方）：直接以本租约为准覆盖，
+    清掉上一个租约残留的期限/off，并把开机+复制期间的长期限收回到正常 TTL。"""
     dl = int(rec["expires_at"] + cfg["guard_grace_minutes"] * 60)
-    if keep_off:
-        return (f"{{ [ \"$(cat /root/.autodl_deadline 2>/dev/null)\" = off ] || "
-                f"{{ echo {dl} > /root/.autodl_deadline && echo {int(rec['hard_deadline'])} > /root/.autodl_hard; }}; }} "
-                f"|| {{ echo '[autodl] 写入保险截止时间失败' >&2; exit 97; }}")
+    merge = "" if install else (
+        "c=$(cat /root/.autodl_deadline 2>/dev/null || true); "
+        '[ "$c" = off ] && exit 0; case "$c" in ""|*[!0-9]*) c=0;; esac; [ "$c" -gt "$n" ] && n=$c; ')
     # 任一写入失败（磁盘满、/root 不可写）立即以 97 退出，不再执行后面的守护脚本或用户命令
-    return (f"{{ echo {dl} > /root/.autodl_deadline && echo {int(rec['hard_deadline'])} > /root/.autodl_hard; }} "
-            f"|| {{ echo '[autodl] 写入保险截止时间失败' >&2; exit 97; }}")
+    return (f"( command -v flock >/dev/null && flock -w 10 9; n={dl}; " + merge +
+            "echo $n > /root/.autodl_deadline.tmp && mv -f /root/.autodl_deadline.tmp /root/.autodl_deadline "
+            f"&& echo {int(rec['hard_deadline'])} > /root/.autodl_hard ) 9>>/root/.autodl_deadline.lock "
+            "|| { echo '[autodl] 写入保险截止时间失败' >&2; exit 97; }")
+
+
+_GUARD_OFF = ("( command -v flock >/dev/null && flock -w 10 9; echo off > /root/.autodl_deadline ) "
+              "9>>/root/.autodl_deadline.lock")
 
 
 def _mark_managed(uuid: str, on: bool = True) -> None:
@@ -134,7 +148,7 @@ def _get_lease(lid: str, touch: bool = True, ttl_minutes: float | None = None, m
         rec = d.get(lid)
         if not rec:
             raise AutoDLError("租约不存在或已被回收（机器可能已被关机），请重新 autodl_acquire")
-        if time.time() > rec["expires_at"] and rec["state"] == "active":
+        if rec["state"] == "stopping" or (time.time() > rec["expires_at"] and rec["state"] == "active"):
             raise AutoDLError("租约已过期，机器即将被回收，请重新 autodl_acquire")
         prev = rec["expires_at"]
         if touch:
@@ -158,6 +172,25 @@ def _rollback(lid: str, rec: dict) -> None:
 
 
 _REMOTE_FAILED = (97, 255, -1)  # 97：截止时间写入失败；255：ssh 本身失败
+
+
+def _drop_lease_locked(lid: str) -> None:
+    """调用方已持有 state 锁时用（不能再调 _drop_lease 重复加锁）。"""
+    d = _load()
+    d.pop(lid, None)
+    _save(d)
+
+
+def _probe_status(uuid: str, tries: int = 3, wait: float = 3) -> str | None:
+    """查实例当前状态；实例已不存在返回 "gone"，接口一直查不通返回 None。"""
+    for n in range(tries):
+        if n:
+            time.sleep(wait)
+        try:
+            return next((i["status"] for i in c.list_instances() if i["uuid"] == uuid), "gone")
+        except AutoDLError:
+            continue
+    return None
 
 
 def _drop_lease(lid: str) -> None:
@@ -220,13 +253,25 @@ def acquire(owner: str, purpose: str = "", prefer: str | None = None, ttl_minute
                     on_lease(lid)  # 让调用方立即记下 lease_id（服务中途重启也能找回、释放）
                     with oplog.context(lease=lid):
                         try:
+                            _mark_managed(pick["uuid"])  # 开机前就登记：开机结果不明时回收器也能兜底关掉
                             if how == "power_on":
                                 c.power_on(pick["uuid"], no_gpu)
-                            _mark_managed(pick["uuid"])
-                        except AutoDLError as e:
-                            dd = _load()          # 已持有 state 锁，直接改，不能再调 _drop_lease
-                            dd.pop(lid, None)
-                            _save(dd)
+                        except AutoDLNetworkError as e:
+                            # 开机请求可能已被受理（读响应超时/断连）：对账实例状态，不能直接丢掉租约
+                            st = _probe_status(pick["uuid"])
+                            if st in (None, "shutdown", "gone"):
+                                if st is None:  # 查不到：保留 pending 租约和 managed 标记，交给回收器到期处理
+                                    ops("ACQUIRE", "ERR", error=f"开机结果未知，租约保留待回收：{e}")
+                                    raise AutoDLError(f"开机请求网络异常且查不到实例状态，租约 {lid} 已保留，"
+                                                      f"回收器会在到期后关机；也可用 autodl_release 立即释放：{e}") from e
+                                _drop_lease_locked(lid)
+                                ops("ACQUIRE", "ERR", error=f"开机请求网络异常，实例状态 {st}：{e}")
+                                raise AutoDLError(f"开机请求网络异常，实例状态 {st}（未开机），已撤销租约：{e}") from e
+                            ops("ACQUIRE_RECOVER", "OK", instance=pick["uuid"], status=st)
+                        except AutoDLError as e:  # 接口明确拒绝：没开机，撤销租约和登记
+                            _drop_lease_locked(lid)
+                            with contextlib.suppress(Exception):
+                                _mark_managed(pick["uuid"], False)
                             ops("ACQUIRE", "ERR", error=str(e))
                             raise
                     break
@@ -270,14 +315,16 @@ def _finish_boot(lid: str, rec: dict, log=lambda m: None) -> dict:
         _install_guard(rec["uuid"], rec, cfg)  # 先装守护（截止时间已含复制时长），复制期间本地服务停了也会到点关机
         if rec["cloned"]:
             c.wait_data_copy(rec["uuid"], cfg["data_copy_timeout_seconds"], log=log)
+        # 先在 pending 期间把机内期限收回到正常 TTL（此时还没有别的操作会写远端），再转 active 提交同一个值
+        r = {**rec, "expires_at": min(time.time() + _ttl_seconds(cfg, rec["ttl_min"]), rec["hard_deadline"])}
+        _install_guard(rec["uuid"], r, cfg)
         with state_lock():
             d = _load()
-            r = d[lid]
-            r.update(state="active", alias=inst["machine_alias"],
-                     expires_at=min(time.time() + _ttl_seconds(cfg, r["ttl_min"]), r["hard_deadline"]))
+            if lid not in d:
+                raise AutoDLError("租约在启动过程中已被释放")
+            r = {**d[lid], "state": "active", "alias": inst["machine_alias"], "expires_at": r["expires_at"]}
             d[lid] = r
             _save(d)
-        _install_guard(rec["uuid"], r, cfg)  # 刷新为 active 后的截止时间
         ops("LEASE_ACTIVE", "OK", instance=f"{inst['machine_alias']}({rec['uuid']})", expires=human(r["expires_at"]))
         return _lease_view(lid, r, inst)
     except Exception as e:
@@ -300,7 +347,7 @@ def _lease_view(lid: str, rec: dict, inst: dict) -> dict:
 
 def _install_guard(uuid: str, rec: dict, cfg: dict, attempts: int = 6) -> None:
     """装机内保险关机。刚 running 时 sshd 可能还没就绪，重试几次；始终失败则抛错，由调用方关机回收。"""
-    script = _deadline_cmds(rec, cfg, keep_off=False) + "\n" + GUARD_SCRIPT
+    script = _deadline_cmds(rec, cfg, install=True) + "\n" + GUARD_SCRIPT
     for n in range(1, attempts + 1):
         r = c.run_ssh(uuid, script, timeout=60,
                       shown=f"# [autodl] 安装保险关机守护 deadline={human(rec['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
@@ -451,7 +498,7 @@ def _release(lid: str, power_off: bool, reason: str = "") -> dict:
                 _mark_managed(rec["uuid"], False)
         else:
             # 交还给用户自己用：关掉保险。失败则抛错并保留租约，否则机内守护仍会按旧时间关机
-            r = c.run_ssh(rec["uuid"], "echo off > /root/.autodl_deadline", timeout=30,
+            r = c.run_ssh(rec["uuid"], _GUARD_OFF, timeout=30,
                           shown="# [autodl] 解除保险关机（用户保留机器）")
             _check_remote(r, "LEASE_RELEASE", rec["uuid"])
             _mark_managed(rec["uuid"], False)
@@ -569,18 +616,27 @@ def reap() -> list[str]:
                         expires=human(ext["expires_at"]))
                     acts.append(f"{lid}: 后台任务仍在跑，顺延 10 分钟")
                 elif kind == "expire":
-                    if inst["status"] == "running":
+                    # 关机接口只代表“请求已受理”：先转 stopping 保留租约，等实例列表确认 shutdown 后再撤销；没关掉就重发
+                    if inst["status"] == "shutdown":
+                        _mark_managed(r["uuid"], False)
+                        d.pop(lid)
+                        ops("REAP", "OK", action="expire_off", instance=f"{inst['machine_alias']}({r['uuid']})",
+                            expired_at=human(r["expires_at"]))
+                        acts.append(f"{lid}({inst['machine_alias']}): 已确认关机，撤销租约")
+                    elif inst["status"] == "running":
                         try:
                             c.power_off(r["uuid"])
                         except AutoDLError as e:
                             ops("REAP", "ERR", action="power_off", instance=r["uuid"], error=str(e))
                             acts.append(f"{lid}: 关机失败，保留租约下一轮重试")
                             continue
-                    _mark_managed(r["uuid"], False)
-                    d.pop(lid)
-                    ops("REAP", "OK", action="expire_off", instance=f"{inst['machine_alias']}({r['uuid']})",
-                        expired_at=human(r["expires_at"]))
-                    acts.append(f"{lid}({inst['machine_alias']}): 租约过期，已关机并撤销")
+                        r["state"] = "stopping"
+                        d[lid] = r
+                        ops("REAP", "OK", action="power_off_requested", instance=f"{inst['machine_alias']}({r['uuid']})",
+                            expired_at=human(r["expires_at"]))
+                        acts.append(f"{lid}({inst['machine_alias']}): 租约过期，已发出关机请求，确认关机后撤销")
+                    else:  # 关机中等过渡状态：保留租约，下一轮再确认
+                        acts.append(f"{lid}({inst['machine_alias']}): 实例 {inst['status']}，下一轮确认关机")
         _save(d)
         leased = {r["uuid"] for r in d.values()}
         with state_lock("managed"):
@@ -597,9 +653,9 @@ def reap() -> list[str]:
                         ops("REAP", "ERR", action="orphan_off", instance=u, error=str(e))
                         acts.append(f"{inst['machine_alias']}: 无租约的自启机器关机失败，下一轮重试")
                         continue
-                    ops("REAP", "OK", action="orphan_off", instance=f"{inst['machine_alias']}({u})")
-                    acts.append(f"{inst['machine_alias']}: 无租约的自启机器，已关机")
-                _mark_managed(u, False)
+                    # 保留 managed 标记：下一轮实例列表确认 shutdown 才清除，没关掉会再发一次
+                    ops("REAP", "OK", action="orphan_off_requested", instance=f"{inst['machine_alias']}({u})")
+                    acts.append(f"{inst['machine_alias']}: 无租约的自启机器，已发出关机请求")
     return acts
 
 
