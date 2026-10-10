@@ -29,10 +29,11 @@ while true; do
   sleep 30
   now=$(date +%s); dl=$(cat /root/.autodl_deadline 2>/dev/null || echo 0); hd=$(cat /root/.autodl_hard 2>/dev/null || echo 0)
   [ "$dl" = "off" ] && exit 0
+  if [ "$hd" -gt 0 ] && [ "$now" -gt "$hd" ]; then shutdown; exit 0; fi  # 硬上限独立于租约截止时间
   if [ "$now" -gt "$dl" ]; then
     live=0
     for f in /root/.autodl_jobs/*.pid; do [ -e "$f" ] && tr '\0' ' ' < "/proc/$(cat "$f")/cmdline" 2>/dev/null | grep -q "$(basename "$f" .pid).sh" && live=1; done
-    if [ "$live" = 0 ] || [ "$now" -gt "$hd" ]; then shutdown; exit 0; fi
+    if [ "$live" = 0 ]; then shutdown; exit 0; fi
   fi
 done
 EOS
