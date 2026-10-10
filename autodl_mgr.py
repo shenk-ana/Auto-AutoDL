@@ -23,19 +23,22 @@ GUARD_SCRIPT = r"""mkdir -p /root/.autodl_jobs
 cat > /root/.autodl_guard.sh <<'EOS'
 #!/bin/bash
 echo $$ > /root/.autodl_guard.pid
+trap 'rm -f /root/.autodl_guard.pid' EXIT
 while true; do
   sleep 30
   now=$(date +%s); dl=$(cat /root/.autodl_deadline 2>/dev/null || echo 0); hd=$(cat /root/.autodl_hard 2>/dev/null || echo 0)
   [ "$dl" = "off" ] && exit 0
   if [ "$now" -gt "$dl" ]; then
     live=0
-    for f in /root/.autodl_jobs/*.pid; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && live=1; done
+    for f in /root/.autodl_jobs/*.pid; do [ -e "$f" ] && tr '\0' ' ' < "/proc/$(cat "$f")/cmdline" 2>/dev/null | grep -q "$(basename "$f" .pid).sh" && live=1; done
     if [ "$live" = 0 ] || [ "$now" -gt "$hd" ]; then shutdown; exit 0; fi
   fi
 done
 EOS
 chmod +x /root/.autodl_guard.sh
-if ! { [ -e /root/.autodl_guard.pid ] && kill -0 "$(cat /root/.autodl_guard.pid)" 2>/dev/null; }; then
+# 只认真正的守护进程：关机重开后旧 pid 文件里的数字可能已属于别的进程（后台任务同理，按命令行核对）
+gp=$(cat /root/.autodl_guard.pid 2>/dev/null)
+if ! { [ -n "$gp" ] && tr '\0' ' ' < "/proc/$gp/cmdline" 2>/dev/null | grep -q autodl_guard; }; then
   setsid nohup /root/.autodl_guard.sh >/dev/null 2>&1 < /dev/null &
 fi
 """
@@ -185,11 +188,12 @@ def acquire(owner: str, purpose: str = "", prefer: str | None = None, ttl_minute
 
 
 def _finish_boot(lid: str, rec: dict, log=lambda m: None) -> dict:
-    """等机器 running（克隆则等数据盘复制完），装保险，把租约转为 active。失败则关机并撤销租约。"""
+    """等机器 running，立即装保险；克隆则再等数据盘复制完；把租约转为 active 并刷新保险截止时间。失败则关机并撤销租约。"""
     cfg = load_config()
     try:
         inst = c.wait_status(rec["uuid"], "running", cfg["boot_timeout_seconds"])
-        log(f"{inst['machine_alias']} 已 running" + ("，等待数据盘复制完成" if rec["cloned"] else "，安装保险关机"))
+        log(f"{inst['machine_alias']} 已 running，安装保险关机" + ("，等待数据盘复制完成" if rec["cloned"] else ""))
+        _install_guard(rec["uuid"], rec, cfg)  # 先装守护（截止时间已含复制时长），复制期间本地服务停了也会到点关机
         if rec["cloned"]:
             c.wait_data_copy(rec["uuid"], cfg["data_copy_timeout_seconds"], log=log)
         with state_lock():
@@ -199,7 +203,7 @@ def _finish_boot(lid: str, rec: dict, log=lambda m: None) -> dict:
                      expires_at=min(time.time() + _ttl_seconds(cfg, r["ttl_min"]), r["hard_deadline"]))
             d[lid] = r
             _save(d)
-        _install_guard(rec["uuid"], r, cfg)
+        _install_guard(rec["uuid"], r, cfg)  # 刷新为 active 后的截止时间
         ops("LEASE_ACTIVE", "OK", instance=f"{inst['machine_alias']}({rec['uuid']})", expires=human(r["expires_at"]))
         return _lease_view(lid, r, inst)
     except Exception as e:
@@ -277,7 +281,8 @@ def job_status(lease_id: str, job_id: str, tail: int = 40) -> dict:
     script = (_deadline_cmds(rec, cfg) + "\n"
               f"cd {d} 2>/dev/null || {{ echo NOJOB; exit 0; }}\n"
               f"if [ -e {jid}.exit ]; then echo \"STATE=done exit=$(cat {jid}.exit)\"; "
-              f"elif [ -e {jid}.pid ] && kill -0 \"$(cat {jid}.pid)\" 2>/dev/null; then echo STATE=running; "
+              f"elif [ -e {jid}.pid ] && tr '\\0' ' ' < \"/proc/$(cat {jid}.pid)/cmdline\" 2>/dev/null | grep -q {jid}.sh; "
+              f"then echo STATE=running; "
               f"else echo STATE=unknown; fi\ntail -n {int(tail)} {jid}.log 2>/dev/null\n")
     with oplog.context(owner=rec["owner"], lease=lease_id):
         r = c.run_ssh(rec["uuid"], script, timeout=60, shown=f"# [autodl] 查看后台任务 {jid}")
@@ -373,8 +378,8 @@ def power_off_guarded(instance: str, lease_id: str = "", force: bool = False) ->
 def _jobs_alive(uuid: str) -> bool | None:
     """机内是否还有后台任务在跑；ssh 不通时返回 None（未知），别当成“没有任务”去关机。"""
     try:
-        r = c.run_ssh(uuid, 'for f in /root/.autodl_jobs/*.pid; do [ -e "$f" ] && kill -0 "$(cat "$f")" 2>/dev/null && '
-                      'echo ALIVE; done; true', timeout=30, log=False)
+        r = c.run_ssh(uuid, 'for f in /root/.autodl_jobs/*.pid; do [ -e "$f" ] && tr "\\0" " " < "/proc/$(cat "$f")/cmdline" '
+                      '2>/dev/null | grep -q "$(basename "$f" .pid).sh" && echo ALIVE; done; true', timeout=30, log=False)
     except AutoDLError:
         return None
     return "ALIVE" in r["output"] if r["exit"] == 0 else None
