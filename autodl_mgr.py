@@ -136,12 +136,28 @@ def _get_lease(lid: str, touch: bool = True, ttl_minutes: float | None = None, m
             raise AutoDLError("租约不存在或已被回收（机器可能已被关机），请重新 autodl_acquire")
         if time.time() > rec["expires_at"] and rec["state"] == "active":
             raise AutoDLError("租约已过期，机器即将被回收，请重新 autodl_acquire")
+        prev = rec["expires_at"]
         if touch:
             hold = max(_ttl_seconds(cfg, ttl_minutes or rec.get("ttl_min")), min_seconds)  # 长传输/长命令期间至少撑到它结束
-            rec["expires_at"] = min(time.time() + hold, rec["hard_deadline"])
+            # 只延长不缩短：并发的普通操作不能把长传输/长命令争取到的时间改短
+            rec["expires_at"] = min(max(rec["expires_at"], time.time() + hold), rec["hard_deadline"])
             d[lid] = rec
             _save(d)
-        return dict(rec)
+        return {**rec, "_prev": prev}
+
+
+def _rollback(lid: str, rec: dict) -> None:
+    """远端截止时间没写成功：把本地到期时间退回去（期间已被别人改过就不动），本地和机内守护保持一致。"""
+    with contextlib.suppress(Exception), state_lock():
+        d = _load()
+        cur = d.get(lid)
+        if cur and cur["expires_at"] == rec["expires_at"] and rec["_prev"] != rec["expires_at"]:
+            cur["expires_at"] = rec["_prev"]
+            d[lid] = cur
+            _save(d)
+
+
+_REMOTE_FAILED = (97, 255, -1)  # 97：截止时间写入失败；255：ssh 本身失败
 
 
 def _drop_lease(lid: str) -> None:
@@ -301,9 +317,13 @@ def renew(lease_id: str, ttl_minutes: float | None = None) -> dict:
     cfg = load_config()
     rec = _get_lease(lease_id, True, ttl_minutes)
     with oplog.context(owner=rec["owner"], lease=lease_id):
-        r = c.run_ssh(rec["uuid"], _deadline_cmds(rec, cfg) + "\n" + GUARD_SCRIPT, timeout=60,
-                      shown=f"# [autodl] 续租，保险关机顺延至 {human(rec['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
-        _check_remote(r, "LEASE_RENEW", rec["uuid"])
+        try:
+            r = c.run_ssh(rec["uuid"], _deadline_cmds(rec, cfg) + "\n" + GUARD_SCRIPT, timeout=60,
+                          shown=f"# [autodl] 续租，保险关机顺延至 {human(rec['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
+            _check_remote(r, "LEASE_RENEW", rec["uuid"])
+        except AutoDLError:
+            _rollback(lease_id, rec)
+            raise
         ops("LEASE_RENEW", "OK", instance=rec["uuid"], expires=human(rec["expires_at"]))
     return {"lease_id": lease_id, "expires_at": human(rec["expires_at"]), "hard_deadline": human(rec["hard_deadline"])}
 
@@ -315,7 +335,13 @@ def exec_cmd(lease_id: str, command: str, timeout: int = 600, background: bool =
     with oplog.context(owner=rec["owner"], lease=lease_id):
         refresh = _deadline_cmds(rec, cfg) + "\n"
         if not background:
-            r = c.run_ssh(rec["uuid"], refresh + command, timeout=timeout, shown=command)
+            try:
+                r = c.run_ssh(rec["uuid"], refresh + command, timeout=timeout, shown=command)
+            except AutoDLError:
+                _rollback(lease_id, rec)
+                raise
+            if r["exit"] in _REMOTE_FAILED:
+                _rollback(lease_id, rec)
             ops("EXEC", "OK" if r["exit"] == 0 else "ERR", instance=f"{rec['alias']}({rec['uuid']})",
                 exit=r["exit"], cmd=command.replace("\n", " ⏎ "))
             return r
@@ -333,7 +359,13 @@ def exec_cmd(lease_id: str, command: str, timeout: int = 600, background: bool =
                   f"for i in $(seq 50); do [ -s {d}/{jid}.pid ] && break; sleep 0.1; done\n"
                   f"[ -s {d}/{jid}.pid ] || {{ echo '[autodl] 后台任务未能启动' >&2; exit 98; }}\n"
                   f"echo started {jid}\n")
-        r = c.run_ssh(rec["uuid"], script, timeout=60, shown=f"# [autodl] 后台任务 {jid}\n{command}")
+        try:
+            r = c.run_ssh(rec["uuid"], script, timeout=60, shown=f"# [autodl] 后台任务 {jid}\n{command}")
+        except AutoDLError:
+            _rollback(lease_id, rec)
+            raise
+        if r["exit"] in _REMOTE_FAILED:
+            _rollback(lease_id, rec)
         ops("JOB_START", "OK" if r["exit"] == 0 else "ERR", instance=f"{rec['alias']}({rec['uuid']})", job=jid,
             cmd=command.replace("\n", " ⏎ "))
         if r["exit"] != 0:
@@ -353,7 +385,13 @@ def job_status(lease_id: str, job_id: str, tail: int = 40) -> dict:
               f"then echo STATE=running; "
               f"else echo STATE=unknown; fi\ntail -n {int(tail)} {jid}.log 2>/dev/null\n")
     with oplog.context(owner=rec["owner"], lease=lease_id):
-        r = c.run_ssh(rec["uuid"], script, timeout=60, shown=f"# [autodl] 查看后台任务 {jid}")
+        try:
+            r = c.run_ssh(rec["uuid"], script, timeout=60, shown=f"# [autodl] 查看后台任务 {jid}")
+        except AutoDLError:
+            _rollback(lease_id, rec)
+            raise
+        if r["exit"] in _REMOTE_FAILED:
+            _rollback(lease_id, rec)
         ops("JOB_STATUS", "OK", instance=rec["uuid"], job=jid)
     return r
 
@@ -367,9 +405,13 @@ def _check_remote(r: dict, event: str, uuid: str) -> None:
 
 def _touch_remote(rec: dict, lease_id: str, why: str) -> None:
     cfg = load_config()
-    r = c.run_ssh(rec["uuid"], _deadline_cmds(rec, cfg), timeout=60, shown=f"# [autodl] {why}，保险关机顺延至 "
-                  f"{human(rec['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
-    _check_remote(r, "LEASE_TOUCH", rec["uuid"])
+    try:
+        r = c.run_ssh(rec["uuid"], _deadline_cmds(rec, cfg), timeout=60, shown=f"# [autodl] {why}，保险关机顺延至 "
+                      f"{human(rec['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
+        _check_remote(r, "LEASE_TOUCH", rec["uuid"])
+    except AutoDLError:
+        _rollback(lease_id, rec)
+        raise
 
 
 def put_file(lease_id: str, local: str, remote: str) -> dict:

@@ -70,6 +70,10 @@ class AuthError(AutoDLError):
     pass
 
 
+class AutoDLNetworkError(AutoDLError):
+    """请求发出后没拿到响应（超时、断连）：服务端可能已经处理了这个请求。"""
+
+
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG.exists():
@@ -179,8 +183,11 @@ def _call(method: str, path: str, body: dict | None = None, params: dict | None 
     a = _auth()
     headers = {"Authorization": a["token"], "AppVersion": a.get("app_version", ""),
                "Content-Type": "application/json"}
-    r = requests.request(method, BASE + path, headers=headers, params=params,
-                         data=json.dumps(body) if body is not None else None, timeout=20)
+    try:
+        r = requests.request(method, BASE + path, headers=headers, params=params,
+                             data=json.dumps(body) if body is not None else None, timeout=20)
+    except requests.RequestException as e:
+        raise AutoDLNetworkError(f"{path} 网络异常：{e!r}") from e
     if r.status_code in (401, 403):
         raise AuthError("token 失效，请重新 login")
     try:
@@ -393,6 +400,20 @@ def _region_group(sign: str) -> list[str]:
     return [sign]
 
 
+def _find_new_instance(before: set[str], tries: int = 4, wait: float = 5) -> str | None:
+    """克隆下单网络异常后的对账：比较下单前后的实例列表（克隆在 clone 锁内串行，新出现的就是这次下的单）。"""
+    for n in range(tries):
+        if n:
+            time.sleep(wait)
+        try:
+            new = [i["uuid"] for i in _raw_instances() if i["uuid"] not in before]
+        except AutoDLError:
+            continue
+        if new:
+            return new[0]
+    return None
+
+
 def abandon_instance(uuid: str, err: BaseException) -> None:
     """克隆已下单（新实例已在计费）但本地记录失败时调用：尽力关机，并抛出带实例 ID 的错误让用户去控制台核实。
     这里不写日志/状态文件——失败的原因往往就是磁盘写不进去。"""
@@ -460,6 +481,12 @@ def clone_instance(ref: str, copy_data_disk: bool = True, dry_run: bool = False)
                 new_uuid = _call("POST", "/api/v1/order/instance/clone/payg", build(tgt))
             except AuthError:
                 raise
+            except AutoDLNetworkError as e:  # 下单结果未知：对账，找到新实例就照常接管，别让它成为没人管的计费机器
+                new_uuid = _find_new_instance(set(raw))
+                if not new_uuid:
+                    ops("CLONE", "ERR", source=src["machine_alias"], error=f"下单结果未知且未发现新实例：{e}")
+                    raise AutoDLError(f"克隆下单时网络异常，对账未发现新实例，请到控制台确认是否已创建：{e}") from e
+                ops("CLONE_RECOVER", "OK", source=src["machine_alias"], new_instance=new_uuid)
             except AutoDLError as e:
                 errors.append(f"{tgt.get('machine_alias')}: {e}")
                 ops("CLONE_TRY", "ERR", source=src["machine_alias"], target=tgt.get("machine_alias"), error=str(e))
