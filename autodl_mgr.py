@@ -239,8 +239,9 @@ def renew(lease_id: str, ttl_minutes: float | None = None) -> dict:
     cfg = load_config()
     rec = _get_lease(lease_id, True, ttl_minutes)
     with oplog.context(owner=rec["owner"], lease=lease_id):
-        c.run_ssh(rec["uuid"], _deadline_cmds(rec, cfg) + "\n" + GUARD_SCRIPT, timeout=60,
-                  shown=f"# [autodl] 续租，保险关机顺延至 {human(rec['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
+        r = c.run_ssh(rec["uuid"], _deadline_cmds(rec, cfg) + "\n" + GUARD_SCRIPT, timeout=60,
+                      shown=f"# [autodl] 续租，保险关机顺延至 {human(rec['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
+        _check_remote(r, "LEASE_RENEW", rec["uuid"])
         ops("LEASE_RENEW", "OK", instance=rec["uuid"], expires=human(rec["expires_at"]))
     return {"lease_id": lease_id, "expires_at": human(rec["expires_at"]), "hard_deadline": human(rec["hard_deadline"])}
 
@@ -284,10 +285,18 @@ def job_status(lease_id: str, job_id: str, tail: int = 40) -> dict:
     return r
 
 
+def _check_remote(r: dict, event: str, uuid: str) -> None:
+    """远端改保险截止时间必须成功：ssh 失败（如 exit 255）时报错，别让调用方以为已顺延/已解除。"""
+    if r["exit"] != 0:
+        ops(event, "ERR", instance=uuid, exit=r["exit"])
+        raise AutoDLError(f"机内保险关机未能更新（ssh exit={r['exit']}），请稍后重试：{r['output'][-300:]}")
+
+
 def _touch_remote(rec: dict, lease_id: str, why: str) -> None:
     cfg = load_config()
-    c.run_ssh(rec["uuid"], _deadline_cmds(rec, cfg), timeout=60, shown=f"# [autodl] {why}，保险关机顺延至 "
-              f"{human(rec['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
+    r = c.run_ssh(rec["uuid"], _deadline_cmds(rec, cfg), timeout=60, shown=f"# [autodl] {why}，保险关机顺延至 "
+                  f"{human(rec['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
+    _check_remote(r, "LEASE_TOUCH", rec["uuid"])
 
 
 def put_file(lease_id: str, local: str, remote: str) -> dict:
@@ -324,11 +333,10 @@ def _release(lid: str, power_off: bool, reason: str = "") -> dict:
             finally:
                 _mark_managed(rec["uuid"], False)
         else:
-            try:  # 交还给用户自己用：关掉保险
-                c.run_ssh(rec["uuid"], "echo off > /root/.autodl_deadline", timeout=30,
+            # 交还给用户自己用：关掉保险。失败则抛错并保留租约，否则机内守护仍会按旧时间关机
+            r = c.run_ssh(rec["uuid"], "echo off > /root/.autodl_deadline", timeout=30,
                           shown="# [autodl] 解除保险关机（用户保留机器）")
-            except AutoDLError:
-                pass
+            _check_remote(r, "LEASE_RELEASE", rec["uuid"])
             _mark_managed(rec["uuid"], False)
             out["status"] = "running（保险关机已解除，请自行关机）"
         _drop_lease(lid)
@@ -347,18 +355,18 @@ def power_off_guarded(instance: str, lease_id: str = "", force: bool = False) ->
     inst = c.find(c.list_instances(), instance)
     with state_lock():
         owner = next(((lid, r) for lid, r in _load().items() if r["uuid"] == inst["uuid"]), None)
-    if owner and lease_id != owner[0]:
+        if not owner:  # 无租约：在锁内直接关，避免查完到关机之间被别的窗口 acquire 接管
+            r = c.power_off(inst["uuid"])
+            _mark_managed(inst["uuid"], False)
+            return r
+    if lease_id != owner[0]:
         if not force:
             ops("POWER_OFF", "DENY", instance=inst["machine_alias"], holder=owner[1]["owner"],
                 reason="机器被他人租用，缺少 lease_id")
             raise AutoDLError(f"{inst['machine_alias']} 正被 {owner[1]['owner']} 租用，到期 "
                               f"{human(owner[1]['expires_at'])}。传入对应 lease_id，或在确认无误后 force=true")
         ops("FORCE_OFF", "OK", instance=inst["machine_alias"], holder=owner[1]["owner"])
-    if owner:
-        return _release(owner[0], power_off=True, reason="强制关机" if force else "关机")
-    r = c.power_off(inst["uuid"])
-    _mark_managed(inst["uuid"], False)
-    return r
+    return _release(owner[0], power_off=True, reason="强制关机" if force else "关机")
 
 
 # ---------------------------------------------------------------- 回收器
@@ -432,10 +440,12 @@ def reap() -> list[str]:
                 with oplog.context():
                     try:
                         c.power_off(u)
-                        ops("REAP", "OK", action="orphan_off", instance=f"{inst['machine_alias']}({u})")
-                        acts.append(f"{inst['machine_alias']}: 无租约的自启机器，已关机")
-                    except AutoDLError as e:
+                    except AutoDLError as e:  # 保留 managed 标记，下一轮重试
                         ops("REAP", "ERR", action="orphan_off", instance=u, error=str(e))
+                        acts.append(f"{inst['machine_alias']}: 无租约的自启机器关机失败，下一轮重试")
+                        continue
+                    ops("REAP", "OK", action="orphan_off", instance=f"{inst['machine_alias']}({u})")
+                    acts.append(f"{inst['machine_alias']}: 无租约的自启机器，已关机")
                 _mark_managed(u, False)
     return acts
 
