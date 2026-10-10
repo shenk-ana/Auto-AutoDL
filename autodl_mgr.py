@@ -273,8 +273,11 @@ def exec_cmd(lease_id: str, command: str, timeout: int = 600, background: bool =
         jid = f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(2)}"
         eof = f"EOC_{secrets.token_hex(4)}"
         d = "/root/.autodl_jobs"
-        script = (f"{refresh}mkdir -p {d}\ncat > {d}/{jid}.sh <<'{eof}'\n"
-                  f"echo $$ > {d}/{jid}.pid\n{command}\necho $? > {d}/{jid}.exit\n{eof}\n"
+        # 用户命令单独成文件、由包装脚本用子进程执行：命令里的 exit / exec / set -e 只结束它自己，
+        # 包装脚本一定能写下退出码（job_status 靠它判断成功与否）
+        script = (f"{refresh}mkdir -p {d}\ncat > {d}/{jid}.cmd <<'{eof}'\n{command}\n{eof}\n"
+                  f"cat > {d}/{jid}.sh <<'{eof}'\n"
+                  f"echo $$ > {d}/{jid}.pid\nbash {d}/{jid}.cmd\necho $? > {d}/{jid}.exit\n{eof}\n"
                   f"setsid nohup bash {d}/{jid}.sh > {d}/{jid}.log 2>&1 < /dev/null &\necho started {jid}\n")
         r = c.run_ssh(rec["uuid"], script, timeout=60, shown=f"# [autodl] 后台任务 {jid}\n{command}")
         ops("JOB_START", "OK" if r["exit"] == 0 else "ERR", instance=f"{rec['alias']}({rec['uuid']})", job=jid,

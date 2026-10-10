@@ -118,4 +118,14 @@ def tail(kind: str, name: str = "", lines: int = 50) -> str:
         p = LOG_DIR / "linux" / f"{day}_{machine_tag(name)}.log"
     if not p.exists():
         return f"(没有 {p.name})"
-    return "".join(p.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)[-lines:])
+    lines = max(1, min(int(lines), 1000))
+    # 从文件末尾按块往前读，只读够需要的行：日志可能被训练输出撑到几百 MB
+    with open(p, "rb") as f:
+        f.seek(0, 2)
+        pos, buf = f.tell(), b""
+        while pos > 0 and buf.count(b"\n") <= lines:
+            step = min(65536, pos)
+            pos -= step
+            f.seek(pos)
+            buf = f.read(step) + buf
+    return "".join(buf.decode("utf-8", errors="replace").splitlines(keepends=True)[-lines:])
