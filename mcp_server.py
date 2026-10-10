@@ -67,7 +67,11 @@ def _job_view(ticket: str) -> dict:
     if j["state"] == "pending":
         return {**base, "state": "pending", "next": f"继续调用 autodl_acquire_status(ticket='{ticket}')，直到 state=ready"}
     if j["state"] == "error":
-        return {**base, "state": "error", "error": j["error"]}
+        out = {**base, "state": "error", "error": j["error"]}
+        if j.get("lease_id"):  # 租约已建立后才失败：自动回收也可能失败，把 lease_id 交给调用方清理
+            out.update(lease_id=j["lease_id"], next="申请失败但租约曾建立：请用这个 lease_id 调 autodl_release 确认已释放"
+                                                    "（返回“租约不存在”说明已自动回收）")
+        return out
     return {**base, "state": "ready", **j["result"]}
 
 

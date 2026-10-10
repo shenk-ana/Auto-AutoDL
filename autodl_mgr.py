@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import secrets
 import time
 
@@ -17,6 +18,7 @@ from autodl_core import AutoDLError, jload, jsave, load_config, state_lock
 from oplog import human, ops
 
 LEASES = c.STATE / "leases.json"
+RESERVED = c.STATE / "clone_sources.json"  # 正在被克隆的源机 {令牌: [uuid, 开始时间]}，期间不分配给别人
 MANAGED = c.STATE / "managed.json"   # 由本工具开的机器：{uuid: 开机时间}，无租约时会被回收
 
 GUARD_SCRIPT = r"""set -e
@@ -49,6 +51,45 @@ guard_up || { echo '[autodl] 保险关机守护未能启动' >&2; exit 96; }
 """
 
 
+# ---------------------------------------------------------------- 克隆源登记（克隆在全局锁外执行）
+def _reserved() -> set[str]:
+    return {u for u, t in jload(RESERVED, {}).values() if time.time() - t < 3600}
+
+
+def _reserve(uuid: str) -> str:
+    tok = secrets.token_hex(4)
+    with state_lock("reserved"):
+        d = jload(RESERVED, {})
+        d[tok] = [uuid, time.time()]
+        jsave(RESERVED, d)
+    return tok
+
+
+def _unreserve(tok: str) -> None:
+    with contextlib.suppress(Exception), state_lock("reserved"):
+        d = jload(RESERVED, {})
+        d.pop(tok, None)
+        jsave(RESERVED, d)
+
+
+def _clone_and_lease(owner: str, purpose: str, src: dict, copy_data_disk: bool, ttl_minutes, tok: str,
+                     on_lease=lambda lid: None) -> tuple[str, dict, dict]:
+    """在全局锁外下单克隆（慢：快照、宿主机分页、最多 10 次下单），再加锁建租约。源机全程处于登记状态。"""
+    try:
+        res = c.clone_instance(src["uuid"], copy_data_disk)
+        with state_lock():
+            try:  # 新实例已在计费：本地记账失败就关掉它，别留下回收器看不到的机器
+                lid, rec = _new_lease(owner, purpose, res["new_uuid"], "(克隆中)", ttl_minutes, True)
+                on_lease(lid)
+                _mark_managed(res["new_uuid"])
+                c.set_machine(res["new_uuid"], cloned_from=src["uuid"], **c.login_overrides(src["uuid"]))
+            except Exception as e:  # noqa: BLE001
+                c.abandon_instance(res["new_uuid"], e)
+        return lid, rec, res
+    finally:
+        _unreserve(tok)
+
+
 # ---------------------------------------------------------------- 租约存取
 def _load() -> dict:
     return jload(LEASES, {})
@@ -63,8 +104,9 @@ def _ttl_seconds(cfg: dict, minutes: float | None) -> float:
     return max(60.0, min(m * 60, cfg["max_lease_hours"] * 3600))
 
 
-def _deadline_cmds(rec: dict, cfg: dict, keep_off: bool = False) -> str:
-    """写机内保险截止时间。keep_off=True 时若用户已解除保险（off）则不覆盖（回收器在锁外顺延用）。"""
+def _deadline_cmds(rec: dict, cfg: dict, keep_off: bool = True) -> str:
+    """写机内保险截止时间。默认 keep_off：用户已用 keep_running 解除保险（off）就不覆盖——
+    在途的续租/exec/传输/回收顺延都不能把交还给用户的机器重新挂上关机时间。只有安装守护时传 False。"""
     dl = int(rec["expires_at"] + cfg["guard_grace_minutes"] * 60)
     if keep_off:
         return (f"{{ [ \"$(cat /root/.autodl_deadline 2>/dev/null)\" = off ] || "
@@ -138,12 +180,13 @@ def acquire(owner: str, purpose: str = "", prefer: str | None = None, ttl_minute
     cfg = load_config()
     deadline = time.time() + cfg["wait_seconds"]
     announced = False
+    clone_src, tok = None, ""
     with oplog.context(owner=owner):
         ops("ACQUIRE_START", "OK", purpose=purpose, prefer=prefer, mode="non_gpu" if no_gpu else "gpu")
         while True:
             with state_lock():
                 items = c.list_instances()
-                leased = {l["uuid"] for l in _load().values()}
+                leased = {l["uuid"] for l in _load().values()} | _reserved()  # 正被克隆的源机也不分配
                 pool = [i for i in items if i["uuid"] not in leased and _match(prefer, i)]
                 pick, how = None, None
                 if prefer or cfg["adopt_running"]:
@@ -180,24 +223,20 @@ def acquire(owner: str, purpose: str = "", prefer: str | None = None, ttl_minute
                     if not cands:
                         ops("ACQUIRE", "ERR", error="没有未租用的机器可作克隆源")
                         raise AutoDLError("等待超时，且没有未被租用的机器可作克隆源（不会复制别人租约里的数据）")
-                    src = sorted(cands, key=lambda i: i["status"] != "shutdown")[0]
-                    log("等待超时，克隆同配置机器（含数据盘）")
-                    res = c.clone_instance(src["uuid"], cfg["clone_data_disk"])
-                    pick, how = {"uuid": res["new_uuid"], "machine_alias": "(克隆中)"}, "clone"
-                    try:  # 新实例已在计费：本地记账失败就关掉它，别留下回收器看不到的机器
-                        lid, rec = _new_lease(owner, purpose, res["new_uuid"], "(克隆中)", ttl_minutes, True)
-                        on_lease(lid)
-                        _mark_managed(res["new_uuid"])
-                        c.set_machine(res["new_uuid"], cloned_from=src["uuid"], **c.login_overrides(src["uuid"]))
-                    except Exception as e:  # noqa: BLE001
-                        c.abandon_instance(res["new_uuid"], e)
-                    with oplog.context(lease=lid):
-                        ops("LEASE_CREATE", "OK", instance=res["new_uuid"], via="clone")
+                    clone_src = sorted(cands, key=lambda i: i["status"] != "shutdown")[0]
+                    tok = _reserve(clone_src["uuid"])  # 锁内登记源机，克隆本身到锁外做
                     break
             if not announced:
                 log(f"没有空闲 GPU，每 {cfg['poll_seconds']}s 刷新，最多等 {cfg['wait_seconds']}s")
                 announced = True
             time.sleep(cfg["poll_seconds"])
+        if clone_src:
+            log("等待超时，克隆同配置机器（含数据盘）")
+            lid, rec, res = _clone_and_lease(owner, purpose, clone_src, cfg["clone_data_disk"], ttl_minutes, tok,
+                                             on_lease)
+            pick, how = {"uuid": res["new_uuid"], "machine_alias": "(克隆中)"}, "clone"
+            with oplog.context(lease=lid):
+                ops("LEASE_CREATE", "OK", instance=res["new_uuid"], via="clone")
         with oplog.context(lease=lid):
             if how != "clone":
                 ops("LEASE_CREATE", "OK", instance=f"{pick['machine_alias']}({pick['uuid']})", via=how,
@@ -245,7 +284,7 @@ def _lease_view(lid: str, rec: dict, inst: dict) -> dict:
 
 def _install_guard(uuid: str, rec: dict, cfg: dict, attempts: int = 6) -> None:
     """装机内保险关机。刚 running 时 sshd 可能还没就绪，重试几次；始终失败则抛错，由调用方关机回收。"""
-    script = _deadline_cmds(rec, cfg) + "\n" + GUARD_SCRIPT
+    script = _deadline_cmds(rec, cfg, keep_off=False) + "\n" + GUARD_SCRIPT
     for n in range(1, attempts + 1):
         r = c.run_ssh(uuid, script, timeout=60,
                       shown=f"# [autodl] 安装保险关机守护 deadline={human(rec['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
@@ -445,7 +484,7 @@ def reap() -> list[str]:
                 if alive:  # 远端顺延在锁外写；用户已解除保险（off）时不覆盖
                     ext = {**r, "expires_at": min(now + 600, r["hard_deadline"])}
                     try:
-                        rr = c.run_ssh(r["uuid"], _deadline_cmds(ext, cfg, keep_off=True), timeout=30,
+                        rr = c.run_ssh(r["uuid"], _deadline_cmds(ext, cfg), timeout=30,
                                        shown=f"# [autodl] 后台任务仍在运行，保险关机顺延至 "
                                              f"{human(ext['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
                     except AutoDLError as e:
@@ -568,13 +607,8 @@ def manual_clone(owner: str, instance: str, copy_data_disk: bool = True, dry_run
                 ops("CLONE", "DENY", source=src["machine_alias"], holder=holder[1]["owner"], reason="源机器被租用，缺少 lease_id")
                 raise AutoDLError(f"{src['machine_alias']} 正被 {holder[1]['owner']} 租用，克隆会复制它的数据盘；"
                                   f"请提供该租约的 lease_id，或换一台未租用的机器")
-            res = c.clone_instance(src["uuid"], copy_data_disk)
-            try:
-                lid, rec = _new_lease(owner, "手动克隆", res["new_uuid"], "(克隆中)", None, True)
-                _mark_managed(res["new_uuid"])
-                c.set_machine(res["new_uuid"], cloned_from=src["uuid"], **c.login_overrides(src["uuid"]))
-            except Exception as e:  # noqa: BLE001
-                c.abandon_instance(res["new_uuid"], e)
+            tok = _reserve(src["uuid"])
+        lid, rec, res = _clone_and_lease(owner, "手动克隆", src, copy_data_disk, None, tok)
         with oplog.context(lease=lid):
             ops("LEASE_CREATE", "OK", instance=res["new_uuid"], via="manual_clone")
             return _finish_boot(lid, rec, log)
