@@ -20,6 +20,20 @@ from datetime import datetime
 from pathlib import Path
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
+# 尽力脱敏：命令或输出里常见的 token / 密码写法在写日志前替换成 ***（无法覆盖所有写法，敏感值请放环境文件）
+_SECRET_RES = [
+    re.compile(r"(?i)(--?[\w-]*(?:token|password|passwd|secret|api[-_]?key|access[-_]?key)[\w-]*(?:=|\s+)['\"]?)[^\s'\"]+"),
+    re.compile(r"(?i)(\b[\w-]*(?:token|password|passwd|secret|api[-_]?key|access[-_]?key)[\w-]*\s*[=:]\s*['\"]?)[^\s'\"]+"),
+    re.compile(r"(?i)(\bbearer\s+)\S+"),
+    re.compile(r"(\b(?:hf_|sk-|ghp_|gho_|github_pat_|xox[bp]-))[A-Za-z0-9_-]{16,}"),
+]
+
+
+def redact(text: str) -> str:
+    for r in _SECRET_RES:
+        text = r.sub(r"\1***", text)
+    return text
+
 _lock = threading.Lock()
 _ctx: contextvars.ContextVar[dict] = contextvars.ContextVar("oplog_ctx", default={})
 
@@ -51,7 +65,7 @@ def context(**kv):
 
 
 def _val(v) -> str:
-    s = str(v)
+    s = redact(str(v))
     if len(s) > 300:
         s = s[:300] + "…"
     return s if re.fullmatch(r"[\w./:@+\-]+", s) else json.dumps(s, ensure_ascii=False)
@@ -79,12 +93,12 @@ class LinuxLog:
 
     def cmd(self, text: str, local: bool = False) -> None:
         prompt = "[local]$ " if local else f"[{self.user}@{self.tag} ~]$ "
-        lines = text.rstrip("\n").split("\n") or [""]
+        lines = redact(text).rstrip("\n").split("\n") or [""]
         out = "".join(f"[{ts()}] {prompt if i == 0 else '> '}{l}\n" for i, l in enumerate(lines))
         _append(self.path, out)
 
     def out(self, line: str) -> None:
-        _append(self.path, f"[{ts()}] {line.rstrip(chr(13) + chr(10))}\n")
+        _append(self.path, f"[{ts()}] {redact(line).rstrip(chr(13) + chr(10))}\n")
 
 
 def tail(kind: str, name: str = "", lines: int = 50) -> str:

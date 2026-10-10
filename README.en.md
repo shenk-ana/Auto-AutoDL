@@ -65,7 +65,7 @@ Explicit `release` → in-service reaper → an on-instance guard that runs `shu
 <td valign="top">
 
 **📜 Full audit trail**<br>
-Append-only, millisecond-timestamped logs of platform operations and per-machine shell sessions. Tokens and passwords are never logged, and root passwords are never returned to the AI.
+Append-only, millisecond-timestamped logs of platform operations and per-machine shell sessions. Common token / password patterns are redacted before writing, and root passwords are never returned to the AI.
 
 </td>
 </tr>
@@ -255,6 +255,7 @@ Override in `config.json`; missing keys use the defaults. Restart the service af
 > The service binds to `127.0.0.1` only. **Do not expose it on `0.0.0.0`** — anyone with the token can run arbitrary commands on your instances and spend your balance.
 
 - `.secrets/`, `state/`, `logs/`, `machines.json` and `ssh_config.autodl` contain credentials or personal data and are git-ignored — **don't commit them**.
+- Log redaction is best-effort and only covers common forms (`--token xxx`, `XXX_TOKEN=xxx`, `Bearer xxx`, `hf_` / `sk-` keys, …). Keep secrets in env files on the instance rather than inline in commands.
 - SSH host-key checking is disabled because AutoDL hosts and ports change after cloning; use on trusted networks.
 - Cloning only works within one region (see `region_groups`); some hosts don't support cloning, and the next candidate is tried automatically.
 - Instances you start yourself in the web console are not lease-protected and won't be reaped, unless taken over with `autodl_acquire(prefer=…)`.

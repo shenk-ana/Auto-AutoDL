@@ -65,7 +65,7 @@ AI：autodl_acquire → autodl_put → autodl_exec(background) → autodl_job_st
 <td valign="top">
 
 **📜 全程留痕**<br>
-平台操作和每台机器的命令会话按行追加记录，带毫秒时间戳；不记录 token 和密码，root 密码也不会返回给 AI。
+平台操作和每台机器的命令会话按行追加记录，带毫秒时间戳；写入前对常见的 token / 密码写法自动脱敏，root 密码也不会返回给 AI。
 
 </td>
 </tr>
@@ -255,6 +255,7 @@ flowchart LR
 > 服务只绑定 `127.0.0.1`，**不要改成 `0.0.0.0` 暴露到网络**。拿到口令的人可以在你的实例上执行任意命令并消耗你的余额。
 
 - 以下文件包含凭据或个人信息，已被 `.gitignore` 排除，**不要提交**：`.secrets/`、`state/`、`logs/`、`machines.json`、`ssh_config.autodl`。
+- 日志脱敏是尽力而为，只覆盖常见写法（`--token xxx`、`XXX_TOKEN=xxx`、`Bearer xxx`、`hf_` / `sk-` 开头的密钥等）。敏感值尽量放在实例上的环境文件里，不要直接写进命令。
 - 连接实例时关闭了 SSH 主机指纹校验（AutoDL 克隆、换机后主机和端口会变），请只在可信网络中使用。
 - 克隆只能在同一地区内（见 `region_groups`）；部分宿主机不支持克隆，代码会自动换下一台。
 - 你在网页上自己开的机器不受租约保护，也不会被回收器关掉，除非用 `autodl_acquire(prefer=…)` 接管。

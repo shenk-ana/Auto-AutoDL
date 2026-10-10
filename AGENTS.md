@@ -11,7 +11,7 @@ Auto-AutoDL：让 AI 通过 MCP 统一申请、使用、释放 AutoDL GPU 实例
 | `mcp_server.py` | MCP 工具定义；`--http` 常驻服务（Bearer 口令）或 stdio |
 | `autodl_cli.py` | 命令行入口，与 MCP 共用同一套逻辑和磁盘状态 |
 | `oplog.py` | 只追加的操作日志（`logs/autodl/`、`logs/linux/`） |
-| `install_service.ps1` / `install_reaper.ps1` | Windows 计划任务安装脚本（UTF-8 BOM + CRLF，兼容 Windows PowerShell 5.1，修改时保持该编码） |
+| `install_service.ps1` / `install_reaper.ps1` | Windows 计划任务安装脚本（UTF-8 BOM + CRLF，兼容 Windows PowerShell 5.1，修改时保持该编码；`.gitattributes` 已设 `-text`，Git 不会改动换行） |
 | `config.json` | 用户配置，覆盖 `autodl_core.DEFAULT_CONFIG` |
 
 文档：`README.md`（中文，主）、`README.en.md`（英文）。改功能或配置键时两份同步更新。
@@ -24,7 +24,7 @@ Auto-AutoDL：让 AI 通过 MCP 统一申请、使用、释放 AutoDL GPU 实例
 
 ## 约束
 - 不写入、不提交任何凭据或个人数据：`.secrets/`、`state/`、`logs/`、`machines.json`、`ssh_config.autodl` 均已在 `.gitignore`，保持如此。
-- 返回给 AI 的实例字段走 `PUBLIC_FIELDS` 白名单，不得加入 `root_password`、`jupyter_token` 等；日志不得记录 token / 密码。
+- 返回给 AI 的实例字段走 `PUBLIC_FIELDS` 白名单，不得加入 `root_password`、`jupyter_token` 等；写日志的内容都要经过 `oplog.redact()` 脱敏。
 - HTTP 服务默认只绑定 `127.0.0.1`，不要改默认值。
 - 已有 Agent 规则先读后增量修改，不覆盖用户规则。
 

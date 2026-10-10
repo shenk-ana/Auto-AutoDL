@@ -168,8 +168,7 @@ def acquire(owner: str, purpose: str = "", prefer: str | None = None, ttl_minute
                     pick, how = {"uuid": res["new_uuid"], "machine_alias": "(克隆中)"}, "clone"
                     lid, rec = _new_lease(owner, purpose, res["new_uuid"], "(克隆中)", ttl_minutes, True)
                     _mark_managed(res["new_uuid"])
-                    c.set_machine(res["new_uuid"], key=c.machine_login(src)["key"], user=c.machine_login(src)["user"],
-                                  cloned_from=src["uuid"])
+                    c.set_machine(res["new_uuid"], cloned_from=src["uuid"], **c.login_overrides(src["uuid"]))
                     with oplog.context(lease=lid):
                         ops("LEASE_CREATE", "OK", instance=res["new_uuid"], via="clone")
                     break
@@ -221,11 +220,18 @@ def _lease_view(lid: str, rec: dict, inst: dict) -> dict:
             "note": "用完务必 autodl_release；每次操作自动顺延租约，长任务请用 background=true 并定期 autodl_renew"}
 
 
-def _install_guard(uuid: str, rec: dict, cfg: dict) -> None:
+def _install_guard(uuid: str, rec: dict, cfg: dict, attempts: int = 6) -> None:
+    """装机内保险关机。刚 running 时 sshd 可能还没就绪，重试几次；始终失败则抛错，由调用方关机回收。"""
     script = _deadline_cmds(rec, cfg) + "\n" + GUARD_SCRIPT
-    r = c.run_ssh(uuid, script, timeout=60,
-                  shown=f"# [autodl] 安装保险关机守护 deadline={human(rec['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
-    ops("GUARD_INSTALL", "OK" if r["exit"] == 0 else "ERR", instance=uuid, exit=r["exit"])
+    for n in range(1, attempts + 1):
+        r = c.run_ssh(uuid, script, timeout=60,
+                      shown=f"# [autodl] 安装保险关机守护 deadline={human(rec['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
+        ops("GUARD_INSTALL", "OK" if r["exit"] == 0 else "ERR", instance=uuid, exit=r["exit"], attempt=n)
+        if r["exit"] == 0:
+            return
+        if n < attempts:
+            time.sleep(10)
+    raise AutoDLError(f"保险关机守护安装失败（ssh exit={r['exit']}）：{r['output'][-300:]}")
 
 
 # ---------------------------------------------------------------- 租约内操作（都需要 lease_id）
@@ -391,11 +397,19 @@ def reap() -> list[str]:
                     acts.append(f"{lid}: 后台任务仍在跑，顺延 10 分钟")
                     continue
                 if expired:
-                    if inst["status"] in ("running", "starting", "creating", "created_cloning", "created"):
+                    if inst["status"] in ("starting", "creating", "created_cloning", "created"):
+                        # 还在开机/克隆，现在关不了：保留租约，等它 running 后下一轮再关
+                        ops("REAP", "OK", action="wait_boot", reason=f"实例 {inst['status']}，开机后再关",
+                            instance=r["uuid"])
+                        acts.append(f"{lid}: 租约过期但实例 {inst['status']}，下一轮再关")
+                        continue
+                    if inst["status"] == "running":
                         try:
-                            c.power_off(r["uuid"]) if inst["status"] == "running" else None
+                            c.power_off(r["uuid"])
                         except AutoDLError as e:
                             ops("REAP", "ERR", action="power_off", instance=r["uuid"], error=str(e))
+                            acts.append(f"{lid}: 关机失败，保留租约下一轮重试")
+                            continue
                     _mark_managed(r["uuid"], False)
                     d.pop(lid)
                     ops("REAP", "OK", action="expire_off", instance=f"{inst['machine_alias']}({r['uuid']})",
@@ -468,8 +482,7 @@ def manual_clone(owner: str, instance: str, copy_data_disk: bool = True, dry_run
             lid, rec = _new_lease(owner, "手动克隆", res["new_uuid"], "(克隆中)", None, True)
             _mark_managed(res["new_uuid"])
             src = c.find(c.list_instances(), instance)
-            c.set_machine(res["new_uuid"], key=c.machine_login(src)["key"], user=c.machine_login(src)["user"],
-                          cloned_from=src["uuid"])
+            c.set_machine(res["new_uuid"], cloned_from=src["uuid"], **c.login_overrides(src["uuid"]))
         with oplog.context(lease=lid):
             ops("LEASE_CREATE", "OK", instance=res["new_uuid"], via="manual_clone")
             return _finish_boot(lid, rec, log)

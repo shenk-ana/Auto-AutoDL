@@ -9,7 +9,9 @@ AI 用法：autodl_acquire(owner=...) → 轮询 autodl_acquire_status 直到 re
 """
 import argparse
 import asyncio
+import contextlib
 import hmac
+import os
 import secrets
 import sys
 import threading
@@ -194,6 +196,8 @@ def service_token() -> str:
     if not TOKEN_FILE.exists():
         TOKEN_FILE.parent.mkdir(exist_ok=True)
         TOKEN_FILE.write_text(secrets.token_urlsafe(32), encoding="utf-8")
+    with contextlib.suppress(OSError):
+        os.chmod(TOKEN_FILE, 0o600)  # Linux/macOS 下只允许本人读（拿到口令就能执行任意命令）；Windows 上无效果
     return TOKEN_FILE.read_text(encoding="utf-8").strip()
 
 

@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -189,7 +190,7 @@ def sync_machines(items: list[dict]) -> None:
     cfg = load_config()
     db = jload(MACHINES, {})
     new = json.loads(json.dumps(db))
-    new.setdefault("default", {"user": "root", "key": cfg["ssh_key"]})
+    new["default"] = {"user": (db.get("default") or {}).get("user") or "root", "key": cfg["ssh_key"]}
     ins = new.setdefault("instances", {})
     for i in items:
         host, port = _host_port(i.get("ssh"))
@@ -200,7 +201,7 @@ def sync_machines(items: list[dict]) -> None:
     with state_lock("machines"):
         # 合并写入：别的进程可能刚改过密钥等字段，以磁盘最新为底，只覆盖主机/端口
         cur = jload(MACHINES, {})
-        cur.setdefault("default", new["default"])
+        cur["default"] = {**new["default"], **{k: v for k, v in (cur.get("default") or {}).items() if k == "user"}}
         cins = cur.setdefault("instances", {})
         for u, r in new["instances"].items():
             cins.setdefault(u, {}).update({k: r[k] for k in ("alias", "region", "host", "port", "first_seen") if k in r})
@@ -217,13 +218,19 @@ def sync_machines(items: list[dict]) -> None:
 
 
 def machine_login(inst: dict) -> dict:
-    db = jload(MACHINES, {"default": {"user": "root", "key": load_config()["ssh_key"]}, "instances": {}})
+    db = jload(MACHINES, {})
     rec = db.get("instances", {}).get(inst["uuid"], {})
     host, port = _host_port(inst.get("ssh"))
-    user = rec.get("user") or db["default"]["user"]
-    key = rec.get("key") or db["default"]["key"]
+    user = rec.get("user") or (db.get("default") or {}).get("user") or "root"
+    key = rec.get("key") or load_config()["ssh_key"]  # 默认密钥始终以 config.json 为准，逐台覆盖值优先
     return {"host": host, "port": port, "user": user, "key": key,
             "ssh_command": f"ssh -i {key} -p {port} {user}@{host}" if host else None}
+
+
+def login_overrides(uuid: str) -> dict:
+    """某台机器在 machines.json 里显式写的 user/key（克隆时沿用给新机器；没写的继续跟随默认值）。"""
+    rec = jload(MACHINES, {}).get("instances", {}).get(uuid, {})
+    return {k: rec[k] for k in ("user", "key") if rec.get(k)}
 
 
 def set_machine(uuid: str, **fields) -> None:
@@ -470,9 +477,13 @@ def _stream(args: list[str], lg: LinuxLog | None, shown: str, local: bool, input
             p.stdin.close()
         except OSError:
             pass
-    buf: list[str] = []
+    buf: deque[str] = deque()  # 只留够返回的尾部 8000 字符：高频输出的命令不会把常驻服务的内存撑爆
+    size = 0
     for line in p.stdout:
         buf.append(line)
+        size += len(line)
+        while size - len(buf[0]) >= 8000:
+            size -= len(buf.popleft())
         if lg:
             lg.out(line)
     rc = p.wait()
