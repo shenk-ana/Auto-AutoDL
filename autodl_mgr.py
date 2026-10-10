@@ -38,11 +38,14 @@ while true; do
 done
 EOS
 chmod +x /root/.autodl_guard.sh
+command -v setsid >/dev/null
 # 只认真正的守护进程：关机重开后旧 pid 文件里的数字可能已属于别的进程（后台任务同理，按命令行核对）
-gp=$(cat /root/.autodl_guard.pid 2>/dev/null || true)
-if ! { [ -n "$gp" ] && tr '\0' ' ' < "/proc/$gp/cmdline" 2>/dev/null | grep -q autodl_guard; }; then
+guard_up() { gp=$(cat /root/.autodl_guard.pid 2>/dev/null || true); [ -n "$gp" ] && tr '\0' ' ' < "/proc/$gp/cmdline" 2>/dev/null | grep -q autodl_guard; }
+if ! guard_up; then
   setsid nohup /root/.autodl_guard.sh >/dev/null 2>&1 < /dev/null &
 fi
+for i in $(seq 30); do guard_up && break; sleep 0.1; done
+guard_up || { echo '[autodl] 保险关机守护未能启动' >&2; exit 96; }
 """
 
 
@@ -60,8 +63,13 @@ def _ttl_seconds(cfg: dict, minutes: float | None) -> float:
     return max(60.0, min(m * 60, cfg["max_lease_hours"] * 3600))
 
 
-def _deadline_cmds(rec: dict, cfg: dict) -> str:
+def _deadline_cmds(rec: dict, cfg: dict, keep_off: bool = False) -> str:
+    """写机内保险截止时间。keep_off=True 时若用户已解除保险（off）则不覆盖（回收器在锁外顺延用）。"""
     dl = int(rec["expires_at"] + cfg["guard_grace_minutes"] * 60)
+    if keep_off:
+        return (f"{{ [ \"$(cat /root/.autodl_deadline 2>/dev/null)\" = off ] || "
+                f"{{ echo {dl} > /root/.autodl_deadline && echo {int(rec['hard_deadline'])} > /root/.autodl_hard; }}; }} "
+                f"|| {{ echo '[autodl] 写入保险截止时间失败' >&2; exit 97; }}")
     # 任一写入失败（磁盘满、/root 不可写）立即以 97 退出，不再执行后面的守护脚本或用户命令
     return (f"{{ echo {dl} > /root/.autodl_deadline && echo {int(rec['hard_deadline'])} > /root/.autodl_hard; }} "
             f"|| {{ echo '[autodl] 写入保险截止时间失败' >&2; exit 97; }}")
@@ -123,7 +131,7 @@ def _match(prefer: str | None, i: dict) -> bool:
 
 # ---------------------------------------------------------------- 统一分配
 def acquire(owner: str, purpose: str = "", prefer: str | None = None, ttl_minutes: float | None = None,
-            no_gpu: bool = False, log=lambda m: None) -> dict:
+            no_gpu: bool = False, log=lambda m: None, on_lease=lambda lid: None) -> dict:
     """给 owner 分一台机器并发租约：空闲卡的关机机 → 开机；没有则每秒刷新最多等 wait_seconds；仍没有则克隆。"""
     if not owner:
         raise AutoDLError("owner 不能为空（写明谁在用，如 'my-project/train-01'）")
@@ -150,6 +158,7 @@ def acquire(owner: str, purpose: str = "", prefer: str | None = None, ttl_minute
                         pick, how = cand[0], "power_on"
                 if pick:
                     lid, rec = _new_lease(owner, purpose, pick["uuid"], pick["machine_alias"], ttl_minutes, False)
+                    on_lease(lid)  # 让调用方立即记下 lease_id（服务中途重启也能找回、释放）
                     with oplog.context(lease=lid):
                         try:
                             if how == "power_on":
@@ -177,6 +186,7 @@ def acquire(owner: str, purpose: str = "", prefer: str | None = None, ttl_minute
                     pick, how = {"uuid": res["new_uuid"], "machine_alias": "(克隆中)"}, "clone"
                     try:  # 新实例已在计费：本地记账失败就关掉它，别留下回收器看不到的机器
                         lid, rec = _new_lease(owner, purpose, res["new_uuid"], "(克隆中)", ttl_minutes, True)
+                        on_lease(lid)
                         _mark_managed(res["new_uuid"])
                         c.set_machine(res["new_uuid"], cloned_from=src["uuid"], **c.login_overrides(src["uuid"]))
                     except Exception as e:  # noqa: BLE001
@@ -432,8 +442,19 @@ def reap() -> list[str]:
                     ops("REAP", "ERR", action="probe", reason="ssh 探测后台任务失败", instance=r["uuid"])
                     acts.append(f"{lid}: 探测后台任务失败，下一轮重试")
                     continue
-                if alive:
-                    plan[lid] = ("extend", min(now + 600, r["hard_deadline"]))
+                if alive:  # 远端顺延在锁外写；用户已解除保险（off）时不覆盖
+                    ext = {**r, "expires_at": min(now + 600, r["hard_deadline"])}
+                    try:
+                        rr = c.run_ssh(r["uuid"], _deadline_cmds(ext, cfg, keep_off=True), timeout=30,
+                                       shown=f"# [autodl] 后台任务仍在运行，保险关机顺延至 "
+                                             f"{human(ext['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
+                    except AutoDLError as e:
+                        rr = {"exit": -1, "output": str(e)}
+                    if rr["exit"] != 0:
+                        ops("REAP", "ERR", action="extend", instance=r["uuid"], exit=rr["exit"])
+                        acts.append(f"{lid}: 后台任务仍在跑，但机内保险未能顺延，下一轮重试")
+                        continue
+                    plan[lid] = ("extend", ext["expires_at"])
                     continue
             if expired:
                 if inst["status"] in ("starting", "creating", "created_cloning", "created"):
@@ -460,18 +481,8 @@ def reap() -> list[str]:
                     _mark_managed(r["uuid"], False)
                     ops("REAP", "OK", action="drop_lease", reason=arg, instance=r["uuid"])
                     acts.append(f"{lid}: {arg}，撤销租约")
-                elif kind == "extend":  # 本地和机内守护一起顺延，远端写不进去就不顺延
+                elif kind == "extend":  # 远端已在锁外顺延成功，这里只提交本地到期时间
                     ext = {**r, "expires_at": arg}
-                    try:
-                        rr = c.run_ssh(r["uuid"], _deadline_cmds(ext, cfg), timeout=30,
-                                       shown=f"# [autodl] 后台任务仍在运行，保险关机顺延至 "
-                                             f"{human(ext['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
-                    except AutoDLError as e:
-                        rr = {"exit": -1, "output": str(e)}
-                    if rr["exit"] != 0:
-                        ops("REAP", "ERR", action="extend", instance=r["uuid"], exit=rr["exit"])
-                        acts.append(f"{lid}: 后台任务仍在跑，但机内保险未能顺延，下一轮重试")
-                        continue
                     d[lid] = ext
                     ops("REAP", "OK", action="extend", reason="后台任务仍在运行", instance=r["uuid"],
                         expires=human(ext["expires_at"]))

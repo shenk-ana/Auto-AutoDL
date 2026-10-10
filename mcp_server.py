@@ -45,17 +45,25 @@ def _persist_ticket(ticket: str, job: dict) -> None:
         with c.state_lock("tickets"):
             d = c.jload(TICKETS, {})
             d = {t: j for t, j in d.items() if time.time() - j.get("t0", 0) < 86400}
-            d[ticket] = {k: job[k] for k in ("state", "t0", "log", "owner", "result", "error") if k in job}
+            d[ticket] = {k: job[k] for k in ("state", "t0", "log", "owner", "result", "error", "lease_id") if k in job}
             c.jsave(TICKETS, d)
     except Exception as e:  # noqa: BLE001  持久化失败不影响本次返回
         oplog.ops("TICKET_SAVE", "ERR", error=repr(e))
 
 
 def _job_view(ticket: str) -> dict:
-    j = _jobs.get(ticket) or c.jload(TICKETS, {}).get(ticket)
+    j = _jobs.get(ticket)
+    restarted = j is None
+    j = j or c.jload(TICKETS, {}).get(ticket)
     if not j:
         return {"error": "票据不存在（服务可能重启过）。先 autodl_list 看看是否已有你的租约，没有就重新 autodl_acquire"}
-    base = {"ticket": ticket, "elapsed_seconds": int(time.time() - j["t0"]), "progress": j["log"][-5:]}
+    base = {"ticket": ticket, "elapsed_seconds": int(time.time() - j["t0"]), "progress": j.get("log", [])[-5:]}
+    if j["state"] == "pending" and restarted:  # 申请途中服务重启：线程已不在，交出已建立的租约让调用方释放
+        if j.get("lease_id"):
+            return {**base, "state": "interrupted", "lease_id": j["lease_id"],
+                    "next": "服务重启打断了申请，机器可能已开机但没装好保险：请用这个 lease_id 调 autodl_release 释放，"
+                            "再重新 autodl_acquire（不处理的话回收器也会在租约到期后关机）"}
+        return {**base, "state": "error", "error": "服务重启打断了申请，尚未分配机器，请重新 autodl_acquire"}
     if j["state"] == "pending":
         return {**base, "state": "pending", "next": f"继续调用 autodl_acquire_status(ticket='{ticket}')，直到 state=ready"}
     if j["state"] == "error":
@@ -81,7 +89,8 @@ async def autodl_acquire(owner: str, purpose: str = "", prefer: str = "", ttl_mi
     def work():
         try:
             job["result"] = m.acquire(owner, purpose, prefer or None, ttl_minutes or None, no_gpu,
-                                      log=lambda s: job["log"].append(f"{time.strftime('%H:%M:%S')} {s}"))
+                                      log=lambda s: job["log"].append(f"{time.strftime('%H:%M:%S')} {s}"),
+                                      on_lease=lambda lid: (job.update(lease_id=lid), _persist_ticket(ticket, job)))
             job["state"] = "ready"
         except c.AutoDLError as e:
             job["error"], job["state"] = str(e), "error"
@@ -91,6 +100,7 @@ async def autodl_acquire(owner: str, purpose: str = "", prefer: str = "", ttl_mi
         for old in [t for t, j in _jobs.items() if j["state"] != "pending" and time.time() - j["t0"] > 86400]:
             _jobs.pop(old, None)
 
+    _persist_ticket(ticket, job)  # 先落盘 pending，重启后也认得这张票
     t = threading.Thread(target=work, daemon=True)
     job["thread"] = t
     t.start()

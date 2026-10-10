@@ -370,13 +370,19 @@ def wait_status(uuid: str, want: str, timeout: int, poll: float = 2) -> dict:
 
 # ---------------------------------------------------------------- 克隆
 def _machines(region_signs: list[str], gpu_name: str) -> list[dict]:
-    d = _call("POST", "/api/v1/user/machine/list", {
-        "charge_type": "payg", "region_sign": "", "gpu_type_name": [gpu_name] if gpu_name else [],
-        "machine_tag_name": [], "gpu_idle_num": 1, "mount_net_disk": False,
-        "instance_disk_size_order": "", "date_range": "", "date_from": "", "date_to": "",
-        "page_index": 1, "page_size": 50, "pay_price_order": "", "gpu_idle_type": "",
-        "default_order": True, "region_sign_list": region_signs, "cpu_arch": [], "chip_corp": []})
-    return d.get("list", [])
+    out: list[dict] = []
+    for page in range(1, 21):  # 逐页读全候选宿主机；不满一页即最后一页
+        d = _call("POST", "/api/v1/user/machine/list", {
+            "charge_type": "payg", "region_sign": "", "gpu_type_name": [gpu_name] if gpu_name else [],
+            "machine_tag_name": [], "gpu_idle_num": 1, "mount_net_disk": False,
+            "instance_disk_size_order": "", "date_range": "", "date_from": "", "date_to": "",
+            "page_index": page, "page_size": 50, "pay_price_order": "", "gpu_idle_type": "",
+            "default_order": True, "region_sign_list": region_signs, "cpu_arch": [], "chip_corp": []})
+        items = d.get("list") or []
+        out += items
+        if len(items) < 50:
+            break
+    return out
 
 
 def _region_group(sign: str) -> list[str]:
