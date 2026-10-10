@@ -37,10 +37,22 @@ async def _run(fn, *a, **k):
 
 # ---------------------------------------------------------------- 申请机器：票据 + 轮询
 _jobs: dict[str, dict] = {}
+TICKETS = c.STATE / "tickets.json"   # 已完成的申请结果（含 lease_id），服务重启后凭原 ticket 仍可取回
+
+
+def _persist_ticket(ticket: str, job: dict) -> None:
+    try:
+        with c.state_lock("tickets"):
+            d = c.jload(TICKETS, {})
+            d = {t: j for t, j in d.items() if time.time() - j.get("t0", 0) < 86400}
+            d[ticket] = {k: job[k] for k in ("state", "t0", "log", "owner", "result", "error") if k in job}
+            c.jsave(TICKETS, d)
+    except Exception as e:  # noqa: BLE001  持久化失败不影响本次返回
+        oplog.ops("TICKET_SAVE", "ERR", error=repr(e))
 
 
 def _job_view(ticket: str) -> dict:
-    j = _jobs.get(ticket)
+    j = _jobs.get(ticket) or c.jload(TICKETS, {}).get(ticket)
     if not j:
         return {"error": "票据不存在（服务可能重启过）。先 autodl_list 看看是否已有你的租约，没有就重新 autodl_acquire"}
     base = {"ticket": ticket, "elapsed_seconds": int(time.time() - j["t0"]), "progress": j["log"][-5:]}
@@ -75,6 +87,7 @@ async def autodl_acquire(owner: str, purpose: str = "", prefer: str = "", ttl_mi
             job["error"], job["state"] = str(e), "error"
         except Exception as e:  # noqa: BLE001
             job["error"], job["state"] = repr(e), "error"
+        _persist_ticket(ticket, job)
         for old in [t for t, j in _jobs.items() if j["state"] != "pending" and time.time() - j["t0"] > 86400]:
             _jobs.pop(old, None)
 

@@ -15,6 +15,7 @@ import contextvars
 import hashlib
 import json
 import re
+import sys
 import threading
 import time
 from datetime import datetime
@@ -22,9 +23,11 @@ from pathlib import Path
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 # 尽力脱敏：命令或输出里常见的 token / 密码写法在写日志前替换成 ***（无法覆盖所有写法，敏感值请放环境文件）
+_KEY = r"[\w-]*(?:token|password|passwd|secret|api[-_]?key|access[-_]?key)[\w-]*"
+_VAL = r"(?:\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^\s'\",}]+)"   # 带引号的值整段吞掉（含空格）
 _SECRET_RES = [
-    re.compile(r"(?i)(--?[\w-]*(?:token|password|passwd|secret|api[-_]?key|access[-_]?key)[\w-]*(?:=|\s+)['\"]?)[^\s'\"]+"),
-    re.compile(r"(?i)(\b[\w-]*(?:token|password|passwd|secret|api[-_]?key|access[-_]?key)[\w-]*\s*[=:]\s*['\"]?)[^\s'\"]+"),
+    re.compile(rf"(?i)(--?{_KEY}(?:=|\s+)){_VAL}"),                       # --token xxx / --password='a b'
+    re.compile(rf"(?i)([\"']?\b{_KEY}[\"']?\s*[=:]\s*){_VAL}"),          # KEY=xxx / "password": "xxx"
     re.compile(r"(?i)(\bbearer\s+)\S+"),
     re.compile(r"(\b(?:hf_|sk-|ghp_|gho_|github_pat_|xox[bp]-))[A-Za-z0-9_-]{16,}"),
 ]
@@ -49,10 +52,15 @@ def human(t: float | None) -> str | None:
 
 
 def _append(path: Path, text: str) -> None:
+    """日志尽力写：磁盘满、目录不可写时不抛异常，绝不打断开关机/克隆等业务流程。"""
     with _lock:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8", newline="\n") as f:
-            f.write(text)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        except OSError as e:
+            with contextlib.suppress(Exception):
+                print(f"[oplog] 写日志失败 {path}: {e}", file=sys.stderr)
 
 
 @contextlib.contextmanager

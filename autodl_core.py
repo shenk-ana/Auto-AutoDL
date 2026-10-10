@@ -600,10 +600,12 @@ def check_local_path(local: str, upload: bool) -> Path:
         for base, dirs, files in os.walk(p):
             for name in dirs + files:
                 q = Path(base) / name
-                if q.is_symlink():
+                if q.is_symlink():  # scp -r 会跟随链接：目标也必须合规
                     t = q.resolve()
                     if any(_inside(t, d) or _inside(d, t) for d in deny):
                         raise AutoDLError(f"出于安全考虑，拒绝上传：{q} 是指向 {t} 的符号链接")
+                    if roots and not any(_inside(t, r) for r in roots):
+                        raise AutoDLError(f"拒绝上传：{q} 是指向 transfer_roots 之外 {t} 的符号链接")
     return p
 
 
