@@ -19,7 +19,8 @@ from oplog import human, ops
 LEASES = c.STATE / "leases.json"
 MANAGED = c.STATE / "managed.json"   # 由本工具开的机器：{uuid: 开机时间}，无租约时会被回收
 
-GUARD_SCRIPT = r"""mkdir -p /root/.autodl_jobs
+GUARD_SCRIPT = r"""set -e
+mkdir -p /root/.autodl_jobs
 cat > /root/.autodl_guard.sh <<'EOS'
 #!/bin/bash
 echo $$ > /root/.autodl_guard.pid
@@ -37,7 +38,7 @@ done
 EOS
 chmod +x /root/.autodl_guard.sh
 # 只认真正的守护进程：关机重开后旧 pid 文件里的数字可能已属于别的进程（后台任务同理，按命令行核对）
-gp=$(cat /root/.autodl_guard.pid 2>/dev/null)
+gp=$(cat /root/.autodl_guard.pid 2>/dev/null || true)
 if ! { [ -n "$gp" ] && tr '\0' ' ' < "/proc/$gp/cmdline" 2>/dev/null | grep -q autodl_guard; }; then
   setsid nohup /root/.autodl_guard.sh >/dev/null 2>&1 < /dev/null &
 fi
@@ -60,7 +61,9 @@ def _ttl_seconds(cfg: dict, minutes: float | None) -> float:
 
 def _deadline_cmds(rec: dict, cfg: dict) -> str:
     dl = int(rec["expires_at"] + cfg["guard_grace_minutes"] * 60)
-    return f"echo {dl} > /root/.autodl_deadline; echo {int(rec['hard_deadline'])} > /root/.autodl_hard"
+    # 任一写入失败（磁盘满、/root 不可写）立即以 97 退出，不再执行后面的守护脚本或用户命令
+    return (f"{{ echo {dl} > /root/.autodl_deadline && echo {int(rec['hard_deadline'])} > /root/.autodl_hard; }} "
+            f"|| {{ echo '[autodl] 写入保险截止时间失败' >&2; exit 97; }}")
 
 
 def _mark_managed(uuid: str, on: bool = True) -> None:
