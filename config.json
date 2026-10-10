@@ -1,0 +1,12 @@
+{
+  "wait_seconds": 300,
+  "poll_seconds": 1,
+  "auto_clone": true,
+  "clone_data_disk": true,
+  "max_clones_per_day": 10,
+  "lease_ttl_minutes": 30,
+  "max_lease_hours": 12,
+  "guard_grace_minutes": 5,
+  "reap_grace_minutes": 10,
+  "adopt_running": false
+}

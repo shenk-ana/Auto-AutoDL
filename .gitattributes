@@ -1,0 +1,2 @@
+# Windows PowerShell 5.1 needs UTF-8 BOM + CRLF: keep the bytes as committed
+*.ps1 -text
