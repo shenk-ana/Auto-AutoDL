@@ -1,0 +1,12 @@
+.secrets/
+state/
+logs/
+machines.json
+ssh_config.autodl
+__pycache__/
+*.tmp
+.venv/
+venv/
+.env
+.idea/
+.vscode/
