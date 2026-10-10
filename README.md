@@ -257,6 +257,7 @@ flowchart LR
 > 服务只绑定 `127.0.0.1`，**不要改成 `0.0.0.0` 暴露到网络**。拿到口令的人可以在你的实例上执行任意命令并消耗你的余额。
 
 - `autodl_put` / `autodl_get` 始终拒绝传输敏感路径：`~/.ssh`、`~/.aws`、`~/.gnupg`、`~/.netrc`、`~/.config/gh` 等常见凭据位置、私钥、本项目的 `.secrets/` 和 `state/`（拒绝列表无法穷尽，要彻底收紧请配置 `transfer_roots`）。下载默认只能写进 `download_root`（`~/autodl-transfer`），防止覆盖 `~/.bashrc` 这类启动文件。建议在 `config.json` 里设置 `transfer_roots`，只允许数据目录。
+- `autodl_power_off(force=true)` 可以关掉别人租用中的机器，只会记一条 `FORCE_OFF` 日志，不做额外授权。这是有意保留的应急手段：所有客户端都应是你自己的 AI，提示词里别让 AI 随意使用 `force`。
 - 自动克隆只从没被租用的机器上复制；手动克隆正被租用的机器需要提供那台的 `lease_id`，不会把别人租约里的数据盘复制给新租户。
 - 以下文件包含凭据或个人信息，已被 `.gitignore` 排除，**不要提交**：`.secrets/`、`state/`、`logs/`、`machines.json`、`ssh_config.autodl`。
 - 日志脱敏是尽力而为，只覆盖常见写法（`--token xxx`、`XXX_TOKEN=xxx`、`Bearer xxx`、`hf_` / `sk-` 开头的密钥等）。敏感值尽量放在实例上的环境文件里，不要直接写进命令。

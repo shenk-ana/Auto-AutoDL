@@ -275,13 +275,20 @@ def exec_cmd(lease_id: str, command: str, timeout: int = 600, background: bool =
         d = "/root/.autodl_jobs"
         # 用户命令单独成文件、由包装脚本用子进程执行：命令里的 exit / exec / set -e 只结束它自己，
         # 包装脚本一定能写下退出码（job_status 靠它判断成功与否）
-        script = (f"{refresh}mkdir -p {d}\ncat > {d}/{jid}.cmd <<'{eof}'\n{command}\n{eof}\n"
+        # 任一步失败（不可写、缺 setsid、进程没起来）都以非零退出，不给调用方一个不存在的 job_id
+        script = (f"{refresh}set -e\ncommand -v setsid >/dev/null\nmkdir -p {d}\n"
+                  f"cat > {d}/{jid}.cmd <<'{eof}'\n{command}\n{eof}\n"
                   f"cat > {d}/{jid}.sh <<'{eof}'\n"
                   f"echo $$ > {d}/{jid}.pid\nbash {d}/{jid}.cmd\necho $? > {d}/{jid}.exit\n{eof}\n"
-                  f"setsid nohup bash {d}/{jid}.sh > {d}/{jid}.log 2>&1 < /dev/null &\necho started {jid}\n")
+                  f"setsid nohup bash {d}/{jid}.sh > {d}/{jid}.log 2>&1 < /dev/null &\n"
+                  f"for i in $(seq 50); do [ -s {d}/{jid}.pid ] && break; sleep 0.1; done\n"
+                  f"[ -s {d}/{jid}.pid ] || {{ echo '[autodl] 后台任务未能启动' >&2; exit 98; }}\n"
+                  f"echo started {jid}\n")
         r = c.run_ssh(rec["uuid"], script, timeout=60, shown=f"# [autodl] 后台任务 {jid}\n{command}")
         ops("JOB_START", "OK" if r["exit"] == 0 else "ERR", instance=f"{rec['alias']}({rec['uuid']})", job=jid,
             cmd=command.replace("\n", " ⏎ "))
+        if r["exit"] != 0:
+            raise AutoDLError(f"后台任务启动失败（exit={r['exit']}）：{r['output'][-500:]}")
         return {"job_id": jid, "exit": r["exit"], "note": "用 autodl_job_status 查看进度；任务运行中机器不会被保险关机（到硬上限为止）"}
 
 
@@ -400,52 +407,76 @@ def _jobs_alive(uuid: str) -> bool | None:
 
 
 def reap() -> list[str]:
-    """回收：① 过期租约 → 关机 ② 租约对应机器已关机 → 清理 ③ 本工具开的、无租约且超过宽限的机器 → 关机。"""
+    """回收：① 过期租约 → 关机 ② 租约对应机器已关机 → 清理 ③ 本工具开的、无租约且超过宽限的机器 → 关机。
+    慢的网络操作（实例列表、ssh 探测后台任务）都在锁外做；提交时重新加锁，并跳过期间被续租/释放的租约。
+    锁内只剩关机接口调用和少量顺延写入，不会让其他窗口的 acquire / exec / release 等锁超时。"""
     cfg = load_config()
     acts: list[str] = []
     now = time.time()
+    by = {i["uuid"]: i for i in c.list_instances()}
     with state_lock():
-        by = {i["uuid"]: i for i in c.list_instances()}
+        snap = _load()
+
+    # ---- 第一阶段（锁外）：根据快照和网络探测决定每个租约怎么处理
+    plan: dict[str, tuple[str, object]] = {}
+    for lid, r in snap.items():
+        inst = by.get(r["uuid"])
+        with oplog.context(owner=r["owner"], lease=lid):
+            if inst is None:
+                plan[lid] = ("drop", "实例已不存在")
+                continue
+            expired = now > r["expires_at"]
+            if expired and inst["status"] == "running" and r["state"] == "active" and now < r["hard_deadline"]:
+                alive = _jobs_alive(r["uuid"])
+                if alive is None:  # 探测失败：状态未知，保留租约下一轮再看（硬上限后不再探测，直接关）
+                    ops("REAP", "ERR", action="probe", reason="ssh 探测后台任务失败", instance=r["uuid"])
+                    acts.append(f"{lid}: 探测后台任务失败，下一轮重试")
+                    continue
+                if alive:
+                    plan[lid] = ("extend", min(now + 600, r["hard_deadline"]))
+                    continue
+            if expired:
+                if inst["status"] in ("starting", "creating", "created_cloning", "created"):
+                    # 还在开机/克隆，现在关不了：保留租约，等它 running 后下一轮再关
+                    ops("REAP", "OK", action="wait_boot", reason=f"实例 {inst['status']}，开机后再关",
+                        instance=r["uuid"])
+                    acts.append(f"{lid}: 租约过期但实例 {inst['status']}，下一轮再关")
+                    continue
+                plan[lid] = ("expire", None)
+            elif inst["status"] == "shutdown" and r["state"] == "active":
+                plan[lid] = ("drop", "机器已被关机")
+
+    # ---- 第二阶段（加锁）：只处理期间没变过的租约
+    with state_lock():
         d = _load()
-        for lid, r in list(d.items()):
+        for lid, (kind, arg) in plan.items():
+            r = d.get(lid)
+            if r is None or r["expires_at"] != snap[lid]["expires_at"]:
+                continue  # 期间被续租或释放：本轮不动它
             inst = by.get(r["uuid"])
             with oplog.context(owner=r["owner"], lease=lid):
-                if inst is None:
+                if kind == "drop":
                     d.pop(lid)
-                    ops("REAP", "OK", action="drop_lease", reason="实例已不存在", instance=r["uuid"])
-                    acts.append(f"{lid}: 实例不存在，撤销租约")
-                    continue
-                expired = now > r["expires_at"]
-                if expired and inst["status"] == "running" and r["state"] == "active" and now < r["hard_deadline"]:
-                    alive = _jobs_alive(r["uuid"])
-                    if alive is None:  # 探测失败：状态未知，保留租约下一轮再看（硬上限后不再探测，直接关）
-                        ops("REAP", "ERR", action="probe", reason="ssh 探测后台任务失败", instance=r["uuid"])
-                        acts.append(f"{lid}: 探测后台任务失败，下一轮重试")
+                    _mark_managed(r["uuid"], False)
+                    ops("REAP", "OK", action="drop_lease", reason=arg, instance=r["uuid"])
+                    acts.append(f"{lid}: {arg}，撤销租约")
+                elif kind == "extend":  # 本地和机内守护一起顺延，远端写不进去就不顺延
+                    ext = {**r, "expires_at": arg}
+                    try:
+                        rr = c.run_ssh(r["uuid"], _deadline_cmds(ext, cfg), timeout=30,
+                                       shown=f"# [autodl] 后台任务仍在运行，保险关机顺延至 "
+                                             f"{human(ext['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
+                    except AutoDLError as e:
+                        rr = {"exit": -1, "output": str(e)}
+                    if rr["exit"] != 0:
+                        ops("REAP", "ERR", action="extend", instance=r["uuid"], exit=rr["exit"])
+                        acts.append(f"{lid}: 后台任务仍在跑，但机内保险未能顺延，下一轮重试")
                         continue
-                    if alive:  # 本地和机内守护一起顺延，远端写不进去就不顺延
-                        ext = {**r, "expires_at": min(now + 600, r["hard_deadline"])}
-                        try:
-                            rr = c.run_ssh(r["uuid"], _deadline_cmds(ext, cfg), timeout=60,
-                                           shown=f"# [autodl] 后台任务仍在运行，保险关机顺延至 "
-                                                 f"{human(ext['expires_at'] + cfg['guard_grace_minutes'] * 60)}")
-                        except AutoDLError as e:
-                            rr = {"exit": -1, "output": str(e)}
-                        if rr["exit"] != 0:
-                            ops("REAP", "ERR", action="extend", instance=r["uuid"], exit=rr["exit"])
-                            acts.append(f"{lid}: 后台任务仍在跑，但机内保险未能顺延，下一轮重试")
-                            continue
-                        d[lid] = r = ext
-                        ops("REAP", "OK", action="extend", reason="后台任务仍在运行", instance=r["uuid"],
-                            expires=human(r["expires_at"]))
-                        acts.append(f"{lid}: 后台任务仍在跑，顺延 10 分钟")
-                        continue
-                if expired:
-                    if inst["status"] in ("starting", "creating", "created_cloning", "created"):
-                        # 还在开机/克隆，现在关不了：保留租约，等它 running 后下一轮再关
-                        ops("REAP", "OK", action="wait_boot", reason=f"实例 {inst['status']}，开机后再关",
-                            instance=r["uuid"])
-                        acts.append(f"{lid}: 租约过期但实例 {inst['status']}，下一轮再关")
-                        continue
+                    d[lid] = ext
+                    ops("REAP", "OK", action="extend", reason="后台任务仍在运行", instance=r["uuid"],
+                        expires=human(ext["expires_at"]))
+                    acts.append(f"{lid}: 后台任务仍在跑，顺延 10 分钟")
+                elif kind == "expire":
                     if inst["status"] == "running":
                         try:
                             c.power_off(r["uuid"])
@@ -458,11 +489,6 @@ def reap() -> list[str]:
                     ops("REAP", "OK", action="expire_off", instance=f"{inst['machine_alias']}({r['uuid']})",
                         expired_at=human(r["expires_at"]))
                     acts.append(f"{lid}({inst['machine_alias']}): 租约过期，已关机并撤销")
-                elif inst["status"] == "shutdown" and r["state"] == "active":
-                    d.pop(lid)
-                    _mark_managed(r["uuid"], False)
-                    ops("REAP", "OK", action="drop_lease", reason="机器已被关机", instance=r["uuid"])
-                    acts.append(f"{lid}: 机器已关机，撤销租约")
         _save(d)
         leased = {r["uuid"] for r in d.values()}
         with state_lock("managed"):

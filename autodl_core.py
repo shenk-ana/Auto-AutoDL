@@ -16,7 +16,6 @@ import shutil
 import subprocess
 import threading
 import time
-from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -500,8 +499,7 @@ def _stream(args: list[str], lg: LinuxLog | None, shown: str, local: bool, input
     if lg:
         lg.cmd(shown, local=local)
     p = subprocess.Popen(args, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                         encoding="utf-8", errors="replace")
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     flag = {"to": False}
 
     def kill():
@@ -512,24 +510,33 @@ def _stream(args: list[str], lg: LinuxLog | None, shown: str, local: bool, input
     timer.start()
     if input_text is not None:
         try:
-            p.stdin.buffer.write(input_text.encode("utf-8"))  # 写字节：文本模式在 Windows 会把换行变成回车+换行
+            p.stdin.write(input_text.encode("utf-8"))  # 写字节：避免 Windows 把换行变成回车+换行
             p.stdin.close()
         except OSError:
             pass
-    buf: deque[str] = deque()  # 只留够返回的尾部 8000 字符：高频输出的命令不会把常驻服务的内存撑爆
-    size = 0
-    for line in p.stdout:
-        buf.append(line)
-        size += len(line)
-        while size - len(buf[0]) >= 8000:
-            size -= len(buf.popleft())
+    # 按固定大小的块读（不按行）：没有换行的长输出（进度条、二进制流）也不会在内存里攒成一个大字符串。
+    # 只保留返回所需的尾部；日志按 \n / \r 分行，单段超过 4 KB 就先写出去
+    tail, pending = b"", b""
+    while True:
+        chunk = p.stdout.read1(65536)
+        if not chunk:
+            break
+        tail = (tail + chunk)[-32768:]
         if lg:
-            lg.out(line)
+            *lines, pending = re.split(rb"\r\n|\n|\r", pending + chunk)
+            for ln in lines:
+                lg.out(ln.decode("utf-8", errors="replace"))
+            if len(pending) > 4096:
+                lg.out(pending.decode("utf-8", errors="replace"))
+                pending = b""
+    if lg and pending:
+        lg.out(pending.decode("utf-8", errors="replace"))
     rc = p.wait()
     timer.cancel()
     if flag["to"] and lg:
         lg.out(f"[autodl] 命令超过 {timeout}s，已被终止")
-    return {"exit": rc, "output": "".join(buf)[-8000:], "timed_out": flag["to"]}
+    output = tail.decode("utf-8", errors="replace").replace("\r\n", "\n")[-8000:]
+    return {"exit": rc, "output": output, "timed_out": flag["to"]}
 
 
 def run_ssh(ref: str, command: str, timeout: int = 600, log: bool = True, shown: str | None = None) -> dict:
