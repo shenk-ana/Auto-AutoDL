@@ -308,6 +308,7 @@ def _touch_remote(rec: dict, lease_id: str, why: str) -> None:
 
 
 def put_file(lease_id: str, local: str, remote: str) -> dict:
+    c.check_local_path(local, upload=True)  # 先校验，被拒绝的请求不顺延租约
     rec = _get_lease(lease_id, min_seconds=3600 + 60)
     with oplog.context(owner=rec["owner"], lease=lease_id):
         _touch_remote(rec, lease_id, "开始上传")
@@ -317,6 +318,7 @@ def put_file(lease_id: str, local: str, remote: str) -> dict:
 
 
 def get_file(lease_id: str, remote: str, local: str) -> dict:
+    c.check_local_path(local, upload=False)
     rec = _get_lease(lease_id, min_seconds=3600 + 60)
     with oplog.context(owner=rec["owner"], lease=lease_id):
         _touch_remote(rec, lease_id, "开始下载")

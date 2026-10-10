@@ -26,6 +26,7 @@ Auto-AutoDL：让 AI 通过 MCP 统一申请、使用、释放 AutoDL GPU 实例
 - 不写入、不提交任何凭据或个人数据：`.secrets/`、`state/`、`logs/`、`machines.json`、`ssh_config.autodl` 均已在 `.gitignore`，保持如此。
 - 返回给 AI 的实例字段走 `PUBLIC_FIELDS` 白名单，不得加入 `root_password`、`jupyter_token` 等；写日志的内容都要经过 `oplog.redact()` 脱敏。
 - HTTP 服务默认只绑定 `127.0.0.1`，不要改默认值。
+- 本地文件传输必须经过 `check_local_path()`（敏感路径拒绝 + `transfer_roots` 白名单），不要绕过。
 - 已有 Agent 规则先读后增量修改，不覆盖用户规则。
 
 ## 代码审查

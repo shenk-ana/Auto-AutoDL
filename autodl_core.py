@@ -50,6 +50,8 @@ DEFAULT_CONFIG = {
     "ssh_key": str(Path.home() / ".ssh" / "id_ed25519"),
     # 克隆只能在同一"地区"内：每组是控制台里同一地区的 region_sign，例如西北B区 = west-B/C/D/E
     "region_groups": [["west-B", "west-C", "west-D", "west-E"]],
+    # put/get 允许的本地目录；为空表示不限（敏感路径始终拒绝，见 check_local_path）
+    "transfer_roots": [],
 }
 # 返回给 AI 的字段白名单：绝不包含 root_password / jupyter_token
 PUBLIC_FIELDS = [
@@ -524,7 +526,51 @@ def run_ssh(ref: str, command: str, timeout: int = 600, log: bool = True, shown:
     return _stream(args, ll, shown if shown is not None else command, False, command + "\n", timeout)
 
 
+def _norm(p: Path) -> str:
+    return os.path.normcase(str(p))
+
+
+def _inside(p: Path, root: Path) -> bool:
+    a, b = _norm(p), _norm(root)
+    return a == b or a.startswith(b.rstrip("\\/") + os.sep)
+
+
+def _sensitive_paths() -> list[Path]:
+    """绝不允许传出的本地路径：SSH 目录、本项目的凭据和状态、配置及逐台登记的私钥。"""
+    paths = [Path.home() / ".ssh", ROOT / ".secrets", STATE, Path(load_config()["ssh_key"]).expanduser()]
+    for r in jload(MACHINES, {}).get("instances", {}).values():
+        if r.get("key"):
+            paths.append(Path(r["key"]).expanduser())
+    return [x.resolve() for x in paths]
+
+
+def check_local_path(local: str, upload: bool) -> Path:
+    """校验 put/get 的本地路径（解析符号链接和 .. 之后判断），不合规则抛 AutoDLError。
+    上传：不能是敏感路径、不能包含敏感路径，目录里的符号链接也不能指向敏感路径（scp -r 会跟随链接）。
+    下载：不能写进 ~/.ssh 或本项目目录（代码、配置、凭据）。配置了 transfer_roots 时还必须位于其中之一。"""
+    p = Path(local).expanduser().resolve()
+    roots = [Path(x).expanduser().resolve() for x in load_config().get("transfer_roots") or []]
+    if roots and not any(_inside(p, r) for r in roots):
+        raise AutoDLError(f"本地路径 {p} 不在 config.json 的 transfer_roots 允许范围内")
+    deny = _sensitive_paths()
+    if not upload:
+        deny += [ROOT.resolve()]
+    for d in deny:
+        if _inside(p, d) or (upload and _inside(d, p)):
+            raise AutoDLError(f"出于安全考虑，拒绝传输本地路径 {p}（涉及 {d}）")
+    if upload and p.is_dir():
+        for base, dirs, files in os.walk(p):
+            for name in dirs + files:
+                q = Path(base) / name
+                if q.is_symlink():
+                    t = q.resolve()
+                    if any(_inside(t, d) or _inside(d, t) for d in deny):
+                        raise AutoDLError(f"出于安全考虑，拒绝上传：{q} 是指向 {t} 的符号链接")
+    return p
+
+
 def run_scp(ref: str, local: str, remote: str, upload: bool, timeout: int = 3600) -> dict:
+    check_local_path(local, upload)
     inst = _running(ref)
     lg = machine_login(inst)
     rem = f"{lg['user']}@{lg['host']}:{remote}"

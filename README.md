@@ -248,12 +248,14 @@ flowchart LR
 | `adopt_running` | `false` | 是否允许接管你自己开着的无租约机器 |
 | `ssh_key` | `~/.ssh/id_ed25519` | 登录实例用的私钥路径 |
 | `region_groups` | `[["west-B","west-C","west-D","west-E"]]` | 可互相克隆的地区分组；你的实例在别的地区时按需添加 |
+| `transfer_roots` | `[]` | `autodl_put` / `autodl_get` 允许的本地目录；为空表示不限（敏感路径始终拒绝） |
 
 ## 🛡️ 安全与注意事项
 
 > [!CAUTION]
 > 服务只绑定 `127.0.0.1`，**不要改成 `0.0.0.0` 暴露到网络**。拿到口令的人可以在你的实例上执行任意命令并消耗你的余额。
 
+- `autodl_put` / `autodl_get` 始终拒绝传输敏感路径：`~/.ssh`、私钥、本项目的 `.secrets/` 和 `state/`，下载也不能写进本项目目录。建议在 `config.json` 里设置 `transfer_roots`，只允许数据目录。
 - 以下文件包含凭据或个人信息，已被 `.gitignore` 排除，**不要提交**：`.secrets/`、`state/`、`logs/`、`machines.json`、`ssh_config.autodl`。
 - 日志脱敏是尽力而为，只覆盖常见写法（`--token xxx`、`XXX_TOKEN=xxx`、`Bearer xxx`、`hf_` / `sk-` 开头的密钥等）。敏感值尽量放在实例上的环境文件里，不要直接写进命令。
 - 连接实例时关闭了 SSH 主机指纹校验（AutoDL 克隆、换机后主机和端口会变），请只在可信网络中使用。
